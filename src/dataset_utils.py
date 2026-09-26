@@ -87,40 +87,66 @@ Just return the letters "A", "B", or "C", with no text around it.
 """.strip()
 CHOICE_TO_METRIC = {"A": "is_correct", "B": "is_incorrect", "C": "is_not_attempted"}
 
-# ====================  SANDBOX GRADER  =========================
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
+
+
+# ====================  GRADER  =========================
 class SandboxGrader:
-    """Implements the ChatCompletion-style grader using the Princeton AI-Sandbox."""
-    def __init__(self, model_name: str, temperature: float = 0.):
-        from openai import AzureOpenAI
-        self.client = AzureOpenAI(
-            api_key=os.environ["AI_SANDBOX_KEY"],
-            azure_endpoint="https://api-ai-sandbox.princeton.edu/",
-            api_version="2024-02-01",
-        )
-        self.model = model_name
+    """LLM-as-judge grader used to score predicted answers against gold targets.
+
+    By default this talks to the shared gpt-oss-120b vLLM server on Wulver
+    (no API key needed). Set GRADER_BACKEND=openai (and OPENAI_API_KEY) to
+    grade with a real OpenAI model instead, e.g. when not running on Wulver.
+    """
+    def __init__(self, model_name: str = None, temperature: float = 0., backend: str = None):
+        self.backend = backend or os.environ.get("GRADER_BACKEND", "shared_vllm")
         self.temperature = temperature
         self._match_re = re.compile(r"[ABC]")
 
-    # def __init__(self, model_name: str, temperature: float = 0.):
-    #     from openai import OpenAI 
-    #     self.client = OpenAI(
-    #         api_key=os.environ["OPENAI_API_KEY"],
-    #     )
-        
-    #     self.model = model_name
-    #     self.temperature = temperature
-    #     self._match_re = re.compile(r"[ABC]")
+        if self.backend == "openai":
+            from openai import OpenAI
+            self.client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+            self.model = model_name or "gpt-4o"
+            # a single letter is enough for a non-reasoning OpenAI chat model
+            self.max_tokens = 1
+        else:
+            from openai import OpenAI
+            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
+            self.client = None  # built lazily per-call in grade(), see _client()
+            self.model = model_name or "openai/gpt-oss-120b"
+            # gpt-oss is a reasoning model: its hidden reasoning shares the
+            # max_tokens budget, so grading needs much more than 1 token or
+            # it returns empty before ever emitting the A/B/C verdict.
+            self.max_tokens = 2048
+
+    def _client(self):
+        if self.backend == "openai":
+            return self.client
+        from openai import OpenAI
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
 
     def grade(self, question: str, target: str, predicted: str) -> str:
         prompt = GRADER_TEMPLATE.format(question=question,
                                         target=target,
                                         predicted_answer=predicted)
-        chat = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1,
-            temperature=self.temperature)
-        content = chat.choices[0].message.content
+        prompt += "\n\nRespond with only a single letter: A, B, or C."
+        try:
+            client = self._client()
+            chat = client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=self.max_tokens,
+                temperature=self.temperature)
+            content = chat.choices[0].message.content
+        except Exception as exc:
+            logger.warning(f"Grader query failed: {exc}")
+            content = None
         m = self._match_re.search(content or "")
         return m.group(0) if m else "C"
 
@@ -132,7 +158,7 @@ class DataUtils: # base class for dataset
         self.data = load_json(data_path)
         logger.info(f'Total samples: {len(self.data)}')
         self.top_k = top_k
-        self.grader = SandboxGrader("gpt-4o")
+        self.grader = SandboxGrader()
 
     def process_data_item(self,data_item,top_k=None,include_title=False,add_expanded_answer=True):
         # extract necessary information from raw json file

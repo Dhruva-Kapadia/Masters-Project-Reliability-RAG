@@ -4,9 +4,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import StoppingCriteriaList
 from .helper import StopOnTokens
 #import deepspeed
-from together import Together
-from vllm import LLM, SamplingParams
-from openai import AzureOpenAI
 
 
 from torch import LongTensor, FloatTensor
@@ -29,15 +26,23 @@ MAX_NEW_TOKENS = 50
 
 # for biogen
 # MAX_NEW_TOKENS = 2048
-CONTEXT_MAX_TOKENS = {'Mistral-7B-Instruct-v0.2': 8192, 
-                      'Llama-3.2-3B-Instruct': 8192, 
-                      'Llama-3.2-1B-Instruct': 4096, 
-                      'Llama-3.1-8B-Instruct': 8192, 
+CONTEXT_MAX_TOKENS = {'Mistral-7B-Instruct-v0.2': 8192,
+                      'Llama-3.2-3B-Instruct': 8192,
+                      'Llama-3.2-1B-Instruct': 4096,
+                      'Llama-3.1-8B-Instruct': 8192,
                       'Mixtral-8x7B-Instruct-v0.1': 32000,
                       'DeepSeek-R1-Distill-Qwen-7B': 8192,
                       'gpt-4o':8192,
                       'o1-mini':8192,
-                      'vicuna-7b-v1.5': 4096}
+                      'vicuna-7b-v1.5': 4096,
+                      'openai/gpt-oss-120b': 32768}
+
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). The node:port changes whenever the server is
+# restarted, so we always read this file fresh rather than caching the value.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
 
 
 def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
@@ -62,7 +67,9 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
         elif model_name == 'gpt-4o':
             return GPTModel('gpt-4o', GPT_TMPL, **kwargs) 
         elif model_name == 'gpt-4o-mini':
-            return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs) 
+            return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs)
+        elif model_name == 'gpt-oss-120b':
+            return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL, **kwargs)
         else:
             raise NotImplementedError
     else:
@@ -75,7 +82,9 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
         elif model_name == 'gpt-4o':
             return GPTModel('gpt-4o', GPT_TMPL, **kwargs) 
         elif model_name == 'gpt-4o-mini':
-            return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs) 
+            return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs)
+        elif model_name == 'gpt-oss-120b':
+            return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL, **kwargs)
         else:
             raise NotImplementedError
 
@@ -228,7 +237,9 @@ class VLLMModel(BaseModel):
     def __init__(self, model_name, model_dir, prompt_template, cache_path=None, max_output_tokens=None, seed=42, **kwargs):
         super().__init__(cache_path)
 
-        self.max_output_tokens = MAX_NEW_TOKENS if max_output_tokens is None else max_output_tokens 
+        from vllm import LLM, SamplingParams  # lazy import: vllm is GPU-only and heavy
+
+        self.max_output_tokens = MAX_NEW_TOKENS if max_output_tokens is None else max_output_tokens
         self.model_name = model_name
         self.prompt_template = prompt_template
 
@@ -352,62 +363,30 @@ class GPTModel(BaseModel):
         self.max_output_tokens = MAX_NEW_TOKENS if max_output_tokens is None else max_output_tokens
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
 
-    # def _query(self, prompt): 
-    #     try:
-    #         if self.model_name == "o3-mini" or self.model_name == "o1-mini" or self.model_name == "o1":
-    #             chat = self.client.chat.completions.create(
-    #                 model=self.model_name,
-    #                 messages=[
-    #                     {"role": "system", "content": "You are a helpful assistant."},
-    #                     {"role": "user", "content": prompt}
-    #                 ],
-    #                 max_completion_tokens=self.max_output_tokens
-    #             )   
-    #         else:
-    #             chat = self.client.chat.completions.create(
-    #                 model=self.model_name,
-    #                 messages=[
-    #                     {"role": "system", "content": "You are a helpful assistant."},
-    #                     {"role": "user", "content": prompt}
-    #                 ],
-    #                 temperature=self.temperature,
-    #                 max_tokens=self.max_output_tokens
-    #             )
-    #         self.total_input_tokens += chat.usage.prompt_tokens
-    #         self.total_output_tokens += chat.usage.completion_tokens
-    #         response = chat.choices[0].message.content
-    #     except Exception as e:
-    #         print(e)
-    #         response = "I don't know"
-    #     return response
-
     def _query(self, prompt: str) -> str:
         fallback = "I don't know"
 
         try:
-            # client = AzureOpenAI(
-            #     api_key=os.getenv("AI_SANDBOX_KEY", ""),
-            #     azure_endpoint="https://api-ai-sandbox.princeton.edu/",
-            #     api_version="2024-02-01",
-            # )
-
-            client = AzureOpenAI(
-                api_key=os.getenv("AI_SANDBOX_KEY", ""),
-                azure_endpoint="https://api-ai-sandbox.princeton.edu/",
-                api_version="2025-03-01-preview",
-            )
-
             messages = [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {"role": "user",   "content": prompt},
             ]
 
-            chat = client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=self.temperature,
-                max_tokens=self.max_output_tokens,
-            )
+            # o1/o3-mini style reasoning models don't accept temperature and use
+            # max_completion_tokens instead of max_tokens.
+            if self.model_name in ("o1-mini", "o1", "o3-mini"):
+                chat = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    max_completion_tokens=self.max_output_tokens,
+                )
+            else:
+                chat = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_tokens=self.max_output_tokens,
+                )
 
             # ---- defensive checks -------------------------------------------
             if chat is None or not chat.choices:
@@ -425,9 +404,9 @@ class GPTModel(BaseModel):
             return content
 
         except Exception as exc:
-            print("Sandbox query failed:", exc)
+            print("OpenAI query failed:", exc)
             return fallback
-        
+
 
     # def _batch_query(self, prompt_list):
     #     prompt_list_with_template = [
@@ -461,8 +440,76 @@ class GPTModel(BaseModel):
         return self.query(prompt)
 
 
+class SharedVLLMModel(BaseModel):
+    """Talks to a shared, already-running vLLM server over its OpenAI-compatible
+    API (see CONNECT_TO_SHARED_VLLM.md). We do not start or manage the server;
+    we just look up where it currently is and send requests to it.
+
+    The server's node:port is read fresh from SHARED_VLLM_SERVER_FILE on every
+    query (not cached), since the owner may restart it on a different node at
+    any time.
+    """
+
+    def __init__(self, model_name, prompt_template, cache_path=None, max_output_tokens=None,
+                 server_file=None, **kwargs):
+        super().__init__(cache_path)
+        self.model_name = model_name
+        self.prompt_template = prompt_template
+        self.temperature = 0.7
+        # gpt-oss is a reasoning model: its hidden reasoning tokens share the
+        # max_tokens budget, so a small value returns empty/truncated answers.
+        self.max_output_tokens = 2048 if max_output_tokens is None else max_output_tokens
+        self.server_file = server_file or SHARED_VLLM_SERVER_FILE
+
+    def _base_url(self):
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return f"http://{node_port}/v1"
+
+    def _client(self):
+        # Rebuilt on every call since the node:port can change if the server
+        # was restarted (see SHARED_VLLM_SERVER_FILE handling above).
+        return OpenAI(base_url=self._base_url(), api_key="dummy")
+
+    def _query(self, prompt):
+        fallback = "I don't know"
+        try:
+            client = self._client()
+            chat = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_output_tokens,
+            )
+            if chat is None or not chat.choices:
+                return fallback
+            content = chat.choices[0].message.content
+            if not content:
+                return fallback
+            if getattr(chat, "usage", None):
+                self.total_input_tokens += getattr(chat.usage, "prompt_tokens", 0)
+                self.total_output_tokens += getattr(chat.usage, "completion_tokens", 0)
+            return content
+        except FileNotFoundError:
+            logger.warning(f"Shared vLLM server file not found at {self.server_file}; is the server running?")
+            return fallback
+        except Exception as exc:
+            print("Shared vLLM query failed:", exc)
+            return fallback
+
+    def _batch_query(self, prompt_list):
+        # Keep concurrency modest (usage rule: ~8 parallel requests or fewer,
+        # GPUs are shared). Sequential calls stay well within that.
+        return [self._query(p) for p in prompt_list]
+
+
 class TogetherAIModel(BaseModel):
     def __init__(self, model_name, prompt_template, cache_path=None, max_output_tokens=None, **kwargs):
+        from together import Together  # lazy import: only needed for TogetherAI-backed models
+
         super().__init__(cache_path)
         self.model_name = model_name
         self.prompt_template = prompt_template

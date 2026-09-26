@@ -1,13 +1,15 @@
 import os
 import re
 import logging
-from openai import AzureOpenAI
+from openai import OpenAI
 
 logger = logging.getLogger('RRAG-main')
 
-sandbox_api_key = os.environ['AI_SANDBOX_KEY']
-sandbox_endpoint = "https://api-ai-sandbox.princeton.edu/"
-sandbox_api_version = "2024-02-01"
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
 
 judge_prompt = '''Here is the complete answer:
 
@@ -58,16 +60,35 @@ A. 2005.
 '''
 
 class LLMJudge(object):
+    """Post-processes astuterag/instructrag_icl responses to extract the final answer.
+
+    By default this talks to the shared gpt-oss-120b vLLM server on Wulver
+    (no API key needed). Set JUDGE_BACKEND=openai (and OPENAI_API_KEY) to use
+    a real OpenAI model instead, e.g. when not running on Wulver.
+    """
     def __init__(self):
-        self.client = AzureOpenAI(
-            api_key=sandbox_api_key,
-            azure_endpoint=sandbox_endpoint,
-            api_version=sandbox_api_version
-        )
+        self.backend = os.environ.get("JUDGE_BACKEND", "shared_vllm")
+        if self.backend == "openai":
+            self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+            self.model = "gpt-4o"
+            self.max_tokens = 1000
+        else:
+            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
+            self.model = "openai/gpt-oss-120b"
+            # gpt-oss is a reasoning model: its hidden reasoning shares the
+            # max_tokens budget, so this needs more headroom than gpt-4o did.
+            self.max_tokens = 2048
+
+    def _client(self):
+        if self.backend == "openai":
+            return self.client
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
 
     def judge(self, question, answer):
         final_prompt = judge_prompt.format(question=question, answer=answer)
-        response = self.get_gpt_output("gpt-4o", final_prompt)
+        response = self.get_gpt_output(self.model, final_prompt)
         final_response = self.extract_from_text(response, "ANSWER")
         logger.debug(f"Final response after post-processing by LLM judge: {final_response}")
         return final_response
@@ -75,15 +96,16 @@ class LLMJudge(object):
     def get_gpt_output(self, model, prompt, temperature=0):
         messages = [{"role": "user", "content": prompt}]
         try:
-            response = self.client.chat.completions.create(
+            client = self._client()
+            response = client.chat.completions.create(
                 model=model,
-                temperature=temperature, 
-                max_tokens=1000, 
+                temperature=temperature,
+                max_tokens=self.max_tokens,
                 top_p=0.5,
                 messages=messages)
             return response.choices[0].message.content
         except Exception as e:
-            logger.warning("LLM Judge error getting GPT output:", e)
+            logger.warning(f"LLM Judge error getting output: {e}")
             return ""
 
     def extract_from_text(self, text, tag):
