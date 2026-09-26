@@ -2,10 +2,9 @@
 *.out
 *.z
 logs
-result
+# result
 result_certify
 data/*.json
-cache/
 data/clean_data.py
 scripts/hf.slurm
 scripts/gpt.slurm
