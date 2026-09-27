@@ -37,12 +37,11 @@ CONTEXT_MAX_TOKENS = {'Mistral-7B-Instruct-v0.2': 8192,
                       'vicuna-7b-v1.5': 4096,
                       'openai/gpt-oss-120b': 32768}
 
-# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
-# CONNECT_TO_SHARED_VLLM.md). The node:port changes whenever the server is
-# restarted, so we always read this file fresh rather than caching the value.
-SHARED_VLLM_SERVER_FILE = os.environ.get(
-    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
-)
+# Connection details for the shared gpt-oss-120b vLLM server on Wulver come
+# from the connection config (see CONNECT_TO_SHARED_VLLM.md and
+# src/vllm_config.py). It is re-read on every request, so moving the server
+# only means editing that file.
+from .vllm_config import load_connection as load_vllm_connection
 
 
 def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
@@ -445,7 +444,7 @@ class SharedVLLMModel(BaseModel):
     API (see CONNECT_TO_SHARED_VLLM.md). We do not start or manage the server;
     we just look up where it currently is and send requests to it.
 
-    The server's node:port is read fresh from SHARED_VLLM_SERVER_FILE on every
+    The server's host/port are read fresh from the connection config on every
     query (not cached), since the owner may restart it on a different node at
     any time.
     """
@@ -459,17 +458,17 @@ class SharedVLLMModel(BaseModel):
         # gpt-oss is a reasoning model: its hidden reasoning tokens share the
         # max_tokens budget, so a small value returns empty/truncated answers.
         self.max_output_tokens = 2048 if max_output_tokens is None else max_output_tokens
-        self.server_file = server_file or SHARED_VLLM_SERVER_FILE
+        if server_file:  # optional explicit config path override
+            os.environ["VLLM_CONNECTION_CONFIG"] = server_file
 
     def _base_url(self):
-        with open(self.server_file, 'r') as f:
-            node_port = f.read().strip()
-        return f"http://{node_port}/v1"
+        return load_vllm_connection()["base_url"]
 
     def _client(self):
-        # Rebuilt on every call since the node:port can change if the server
-        # was restarted (see SHARED_VLLM_SERVER_FILE handling above).
-        return OpenAI(base_url=self._base_url(), api_key="dummy")
+        # Rebuilt on every call since the host/port can change if the server
+        # was restarted (the connection config is re-read each time).
+        conn = load_vllm_connection()
+        return OpenAI(base_url=conn["base_url"], api_key=conn["api_key"])
 
     def _query(self, prompt):
         fallback = "I don't know"
@@ -494,7 +493,7 @@ class SharedVLLMModel(BaseModel):
                 self.total_output_tokens += getattr(chat.usage, "completion_tokens", 0)
             return content
         except FileNotFoundError:
-            logger.warning(f"Shared vLLM server file not found at {self.server_file}; is the server running?")
+            logger.warning("vLLM connection config not found; see CONNECT_TO_SHARED_VLLM.md (set VLLM_CONNECTION_CONFIG).")
             return fallback
         except Exception as exc:
             print("Shared vLLM query failed:", exc)

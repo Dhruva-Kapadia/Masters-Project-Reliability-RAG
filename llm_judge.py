@@ -5,11 +5,9 @@ from openai import OpenAI
 
 logger = logging.getLogger('RRAG-main')
 
-# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
-# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
-SHARED_VLLM_SERVER_FILE = os.environ.get(
-    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
-)
+# Shared gpt-oss-120b vLLM server details come from the connection config
+# (see CONNECT_TO_SHARED_VLLM.md and src/vllm_config.py).
+from src.vllm_config import make_client as make_vllm_client
 
 judge_prompt = '''Here is the complete answer:
 
@@ -73,7 +71,6 @@ class LLMJudge(object):
             self.model = "gpt-4o"
             self.max_tokens = 1000
         else:
-            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
             self.model = "openai/gpt-oss-120b"
             # gpt-oss is a reasoning model: its hidden reasoning shares the
             # max_tokens budget, so this needs more headroom than gpt-4o did.
@@ -82,9 +79,7 @@ class LLMJudge(object):
     def _client(self):
         if self.backend == "openai":
             return self.client
-        with open(self.server_file, 'r') as f:
-            node_port = f.read().strip()
-        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
+        return make_vllm_client()  # re-reads the connection config each call
 
     def judge(self, question, answer):
         final_prompt = judge_prompt.format(question=question, answer=answer)

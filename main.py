@@ -52,6 +52,7 @@ def parse_args():
     parser.add_argument('--use_cache', action = 'store_true', help='save/use cache responses from LLM')
     parser.add_argument('--max_samples', type=int, default=None, help='limit maximum number of samples to run for testing') 
     parser.add_argument('--use_open_model_api', action = 'store_true', help='use APIs instead of local model for open models')
+    parser.add_argument('--run_dir', type=str, default='.', help='base directory under which log/, output/, result/, cache/ are created (e.g. runs3)')
 
     args = parser.parse_args()
     return args
@@ -61,24 +62,30 @@ def main():
     args = parse_args()
     LOG_NAME = get_log_name(args)
     logging_level = logging.DEBUG if args.debug else logging.INFO
-    
-    os.makedirs(f'log',exist_ok=True)
-    
+
+    run_dir = args.run_dir
+    log_dir = os.path.join(run_dir, 'log')
+    output_dir = os.path.join(run_dir, 'output')
+    result_dir = os.path.join(run_dir, 'result')
+    cache_dir = os.path.join(run_dir, 'cache')
+
+    os.makedirs(log_dir,exist_ok=True)
+
     logging.basicConfig(#level=logging_level,
         format=':::::::::::::: %(message)s'
     )
 
     logger = logging.getLogger('RRAG-main')
     logger.setLevel(level=logging_level)
-    logger.addHandler(logging.FileHandler(f"log/{LOG_NAME}.log"))
+    logger.addHandler(logging.FileHandler(os.path.join(log_dir, f"{LOG_NAME}.log")))
 
     logger.info(args)
 
     data_tool = load_data(args.dataset_name,args.top_k)
 
     if args.use_cache: # use/save cached responses from LLM
-        os.makedirs(f'cache/',exist_ok=True)
-        cache_path = f'cache/{args.model_name}.z'
+        os.makedirs(cache_dir,exist_ok=True)
+        cache_path = os.path.join(cache_dir, f'{args.model_name}.z')
     else:
         cache_path = None
 
@@ -151,7 +158,8 @@ def main():
     if args.max_samples is not None:
         data_list = data_list[:args.max_samples]
 
-    output_csv_file = f"./output/{LOG_NAME}.csv"
+    os.makedirs(output_dir,exist_ok=True)
+    output_csv_file = os.path.join(output_dir, f"{LOG_NAME}.csv")
     fieldnames = [
         "rep_idx",
         "acc",
@@ -247,8 +255,8 @@ def main():
 
         # save for later analysis, currently used for biogen dataset 
         if args.save_response:
-            os.makedirs(f'result/',exist_ok=True)
-            with open(f'result/{LOG_NAME}.json','w') as f:
+            os.makedirs(result_dir,exist_ok=True)
+            with open(os.path.join(result_dir, f'{LOG_NAME}.json'),'w') as f:
                 json.dump(response_list,f,indent=4)
 
         if args.use_cache:

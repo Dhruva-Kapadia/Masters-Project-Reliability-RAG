@@ -87,11 +87,9 @@ Just return the letters "A", "B", or "C", with no text around it.
 """.strip()
 CHOICE_TO_METRIC = {"A": "is_correct", "B": "is_incorrect", "C": "is_not_attempted"}
 
-# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
-# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
-SHARED_VLLM_SERVER_FILE = os.environ.get(
-    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
-)
+# Shared gpt-oss-120b vLLM server details come from the connection config
+# (see CONNECT_TO_SHARED_VLLM.md and src/vllm_config.py).
+from .vllm_config import make_client as make_vllm_client
 
 
 # ====================  GRADER  =========================
@@ -115,7 +113,6 @@ class SandboxGrader:
             self.max_tokens = 1
         else:
             from openai import OpenAI
-            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
             self.client = None  # built lazily per-call in grade(), see _client()
             self.model = model_name or "openai/gpt-oss-120b"
             # gpt-oss is a reasoning model: its hidden reasoning shares the
@@ -126,10 +123,7 @@ class SandboxGrader:
     def _client(self):
         if self.backend == "openai":
             return self.client
-        from openai import OpenAI
-        with open(self.server_file, 'r') as f:
-            node_port = f.read().strip()
-        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
+        return make_vllm_client()  # re-reads the connection config each call
 
     def grade(self, question: str, target: str, predicted: str) -> str:
         prompt = GRADER_TEMPLATE.format(question=question,
