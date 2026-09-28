@@ -6,6 +6,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import numpy as np
 from src.defense import *
+from src.nli_config import load_nli
 import time
 import random
 
@@ -54,9 +55,7 @@ class SampleMISRRAG(RRAG):
         num_samples: int = 10,
         gamma: float = 1.0,
         err: float = 0.0,
-        nli_model_path: str = (
-            "/scratch/gpfs/zs7353/DeBERTa-v3-large-mnli-fever-anli-ling-wanli"
-        ),
+        nli_model_path: str = None,  # None -> src.nli_config.NLI_MODEL
         contradiction_threshold: float = 0.5,
     ):
         super().__init__(llm)
@@ -67,10 +66,7 @@ class SampleMISRRAG(RRAG):
         self.err = err
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.nli_tok = AutoTokenizer.from_pretrained(nli_model_path)
-        self.nli     = AutoModelForSequenceClassification.from_pretrained(
-            nli_model_path
-        ).to(device)
+        self.nli_tok, self.nli, self.contra_idx = load_nli(nli_model_path, device=device)
 
     # ───────────────────────── main entry ─────────────────────────
     def query(self, data_item: Dict[str, Any]) -> str:
@@ -144,7 +140,7 @@ class SampleMISRRAG(RRAG):
             start_time = time.perf_counter()
             with torch.no_grad():
                 logits = self.nli(**inputs).logits
-            probs = torch.softmax(logits, dim=1)[:, 2]   # CONTRADICTION
+            probs = torch.softmax(logits, dim=1)[:, self.contra_idx]   # CONTRADICTION
             end_time = time.perf_counter()
             print("time for NLI: ", end_time - start_time)
             for p, (i, j) in zip(probs.tolist(), pairs):

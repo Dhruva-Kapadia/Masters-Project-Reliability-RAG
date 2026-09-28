@@ -30,6 +30,7 @@ from itertools import chain, combinations
 import math
 
 from src.decoding_methods import secure_decoding
+from src.nli_config import load_nli, NLI_MODEL
 
 logger = logging.getLogger('RRAG-main')
 
@@ -80,8 +81,7 @@ class GraphBasedRRAG(RRAG):
         self.llm = llm
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # device = "cpu" # for gpt-4o
-        self.nli_tokenizer = AutoTokenizer.from_pretrained("/scratch/gpfs/zs7353/DeBERTa-v3-large-mnli-fever-anli-ling-wanli")
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained("/scratch/gpfs/zs7353/DeBERTa-v3-large-mnli-fever-anli-ling-wanli").to(device)
+        self.nli_tokenizer, self.nli_model, self.contra_idx = load_nli(device=device)
 
     def query(self, data_item):
         docs = data_item['topk_content']
@@ -115,7 +115,7 @@ class GraphBasedRRAG(RRAG):
 
             # Process each batch item and update edges based on contradiction probability
             for idx, (i, j) in enumerate(pair_indices):
-                contradiction_probability = probs[idx][2].item()
+                contradiction_probability = probs[idx][self.contra_idx].item()
                 if contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]:
                     out_edges[i].add(j)
                     in_edges[j].add(i)
@@ -178,8 +178,7 @@ class MISBasedRRAG(RRAG):
         self.err = err
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # device = "cpu"  # for gpt-4o
-        self.nli_tokenizer = AutoTokenizer.from_pretrained("/scratch/gpfs/zs7353/DeBERTa-v3-large-mnli-fever-anli-ling-wanli")
-        self.nli_model = AutoModelForSequenceClassification.from_pretrained("/scratch/gpfs/zs7353/DeBERTa-v3-large-mnli-fever-anli-ling-wanli").to(device)
+        self.nli_tokenizer, self.nli_model, self.contra_idx = load_nli(device=device)
 
     def query(self, data_item):
         # Retrieve the documents and get separate responses.
@@ -214,7 +213,7 @@ class MISBasedRRAG(RRAG):
             
             # For each pair, add an undirected edge if the answers contradict.
             for idx, (i, j) in enumerate(pair_indices):
-                contradiction_probability = probs[idx][2].item()
+                contradiction_probability = probs[idx][self.contra_idx].item()
                 x = random.random()
                 if ("I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]):
                     if contradiction_probability >= 0.5:
