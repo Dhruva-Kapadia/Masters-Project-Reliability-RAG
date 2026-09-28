@@ -50,5 +50,16 @@ python main.py
 --use_cache: add this flag to cache the results(responses) to avoid duplicate running 
 ```
 
+### Viewing contradiction graphs (graph / MIS / sampleMIS)
+Add `--log_graphs` to `main.py` (on by default in `scripts/wulver_run_one.slurm`). Each question's graph is appended to
+`<run_dir>/graphs/<LOG_NAME>.jsonl`: every node's answer, every NLI-scored pair (with `p_contra`, edge or not,
+and whether `--err` flipped it), the set kept by the defense, the documents in the final prompt, the poisoned ranks,
+and whether the final answer was correct / the attack succeeded. Render with
+```
+python scripts/render_graphs.py runs3/graphs/*.jsonl                 # self-contained HTML viewer
+python scripts/render_graphs.py runs3/graphs/X.jsonl --csv X.csv     # one summary row per question
+python scripts/render_graphs.py runs3/graphs/X.jsonl --dot dot/ --render svg   # Graphviz files
+```
+
 ### Acknowledgements
 This repository builds upon and was adapted from the upstream RobustRAG codebase maintained by inspire-group. See the original repository: [inspire-group/RobustRAG](https://github.com/inspire-group/RobustRAG).

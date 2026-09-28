@@ -31,6 +31,7 @@ import math
 
 from src.decoding_methods import secure_decoding
 from src.nli_config import load_nli, NLI_MODEL
+from src import graph_logger
 
 logger = logging.getLogger('RRAG-main')
 
@@ -95,6 +96,7 @@ class GraphBasedRRAG(RRAG):
         premises = []
         hypotheses = []
         pair_indices = []
+        pair_log = [] # every scored pair, for graph_logger
 
         for i in range(k):
             for j in range(i + 1, k):
@@ -116,9 +118,11 @@ class GraphBasedRRAG(RRAG):
             # Process each batch item and update edges based on contradiction probability
             for idx, (i, j) in enumerate(pair_indices):
                 contradiction_probability = probs[idx][self.contra_idx].item()
-                if contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]:
+                is_edge = contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]
+                if is_edge:
                     out_edges[i].add(j)
                     in_edges[j].add(i)
+                pair_log.append({'i': i, 'j': j, 'p_contra': contradiction_probability, 'edge': is_edge})
         
         # Iteratively remove vertices with out-degree greater than (number of remaining vertices)/2
         # remaining = set(range(k))
@@ -127,6 +131,7 @@ class GraphBasedRRAG(RRAG):
         for i in range(k):
             remaining.add(i)
         
+        removal_rounds = [] # vertices dropped in each out-degree pruning round
         removal_occurred = True
         while removal_occurred:
             removal_occurred = False
@@ -139,6 +144,7 @@ class GraphBasedRRAG(RRAG):
                     to_remove.append(v)
             if to_remove:
                 removal_occurred = True
+                removal_rounds.append(sorted(to_remove))
                 for v in to_remove:
                     remaining.discard(v)
         
@@ -157,6 +163,14 @@ class GraphBasedRRAG(RRAG):
         # Sort selected documents by their original rank order
         selected.sort()
         
+        graph_logger.record(
+            'graph',
+            nodes=[{'id': i, 'doc_ranks': [i], 'answer': seperate_responses[i],
+                    'idk': "I don't know" in seperate_responses[i]} for i in range(k)],
+            pairs=pair_log, selected=selected, final_doc_ranks=selected,
+            threshold=0.5, directed=True,
+            extra={'removal_rounds': removal_rounds, 'remaining_after_pruning': sorted(remaining)})
+
         # Update the data_item to include only the selected documents
         new_data_item = data_item.copy()
         new_data_item['topk_content'] = [docs[i] for i in selected]
@@ -192,6 +206,7 @@ class MISBasedRRAG(RRAG):
         # Build an undirected graph: graph[i] holds all vertices j that contradict with document i.
         graph = {i: set() for i in range(k)}
         premises, hypotheses, pair_indices = [], [], [] 
+        pair_log = [] # every scored pair, for graph_logger
 
         for i in range(k):
             for j in range(i + 1, k):
@@ -224,6 +239,9 @@ class MISBasedRRAG(RRAG):
                         if x <= self.err:
                             graph[i].add(j)
                             graph[j].add(i)                            
+                is_edge = j in graph[i]
+                nli_edge = contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]
+                pair_log.append({'i': i, 'j': j, 'p_contra': contradiction_probability, 'edge': is_edge, 'flipped': is_edge != nli_edge})
                 # if (contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]):
                 #     graph[i].add(j)
                 #     graph[j].add(i)
@@ -249,6 +267,13 @@ class MISBasedRRAG(RRAG):
         best_set.sort()  # sort in ascending order (better ranked docs have lower indices)
         logger.info(f"Selected document indices: {best_set}")
         
+        graph_logger.record(
+            'MIS',
+            nodes=[{'id': i, 'doc_ranks': [i], 'answer': seperate_responses[i],
+                    'idk': "I don't know" in seperate_responses[i]} for i in range(k)],
+            pairs=pair_log, selected=best_set, final_doc_ranks=best_set,
+            threshold=0.5, err=self.err)
+
         # Update data_item with only the selected documents.
         new_data_item = data_item.copy()
         new_data_item['topk_content'] = [docs[i] for i in best_set]

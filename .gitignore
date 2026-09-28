@@ -21,7 +21,7 @@ figs_pareto_old
 figs/
 llama3/
 mistral7b/
-scripts/
+# scripts/
 configs/
 run.sh
 # outputs and artifacts

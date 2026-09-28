@@ -7,6 +7,7 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import numpy as np
 from src.defense import *
 from src.nli_config import load_nli
+from src import graph_logger
 import time
 import random
 
@@ -119,6 +120,7 @@ class SampleMISRRAG(RRAG):
 
         graph = {i: set() for i in range(self.num_samples)}
         premises, hypotheses, pairs = [], [], []
+        pair_log = [] # every scored pair of samples, for graph_logger
         for i, j in combinations(range(self.num_samples), 2):
             premise = (
                 f"The answer to the question: {data_item['question']}\n"
@@ -154,6 +156,9 @@ class SampleMISRRAG(RRAG):
                         if x <= self.err:
                             graph[i].add(j)
                             graph[j].add(i)    
+                is_edge = j in graph[i]
+                nli_edge = p >= self.thres and "I don't know" not in answers[i] and "I don't know" not in answers[j]
+                pair_log.append({'i': i, 'j': j, 'p_contra': p, 'edge': is_edge, 'flipped': is_edge != nli_edge})
                 # if p >= self.thres and "I don't know" not in answers[i] and "I don't know" not in answers[j]:
                 #     graph[i].add(j)
                 #     graph[j].add(i)
@@ -167,6 +172,16 @@ class SampleMISRRAG(RRAG):
         mis_doc_idxs = [idx - 1 for s in mis_set_idx for idx in ranks[s] if "I don't know" not in answers[s]]
         mis_docs = [docs[i] for i in mis_doc_idxs]
         logger.info(f"MIS document indices: {mis_doc_idxs}")
+
+        graph_logger.record(
+            'sampleMIS',
+            # nodes are the T samples; doc_ranks are the 0-based ranks drawn into each
+            nodes=[{'id': s, 'doc_ranks': [r - 1 for r in ranks[s]], 'answer': answers[s],
+                    'idk': "I don't know" in answers[s]} for s in range(self.num_samples)],
+            pairs=pair_log, selected=mis_set_idx, final_doc_ranks=mis_doc_idxs,
+            threshold=self.thres, err=self.err,
+            extra={'sample_size': self.sample_size, 'num_samples': self.num_samples,
+                   'gamma': self.gamma, 'doc_sampling_prob': [round(float(w), 4) for w in weights]})
 
         final_item = copy.deepcopy(data_item)
         final_item["topk_content"] = mis_docs

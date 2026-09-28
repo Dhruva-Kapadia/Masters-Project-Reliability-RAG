@@ -1,0 +1,12 @@
+realtimeqa graph none
+realtimeqa graph PIA
+realtimeqa MIS none
+realtimeqa MIS PIA
+realtimeqa sampleMIS none
+realtimeqa sampleMIS PIA
+open_nq graph none
+open_nq graph PIA
+open_nq MIS none
+open_nq MIS PIA
+open_nq sampleMIS none
+open_nq sampleMIS PIA

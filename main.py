@@ -11,6 +11,7 @@ from src.baselines import *
 from src.attack import *
 from src.helper import get_log_name
 from src.sampleMIS import *
+from src import graph_logger
 import matplotlib.pyplot as plt
 import pandas as pd
 from llm_judge import LLMJudge
@@ -52,6 +53,7 @@ def parse_args():
     parser.add_argument('--use_cache', action = 'store_true', help='save/use cache responses from LLM')
     parser.add_argument('--max_samples', type=int, default=None, help='limit maximum number of samples to run for testing') 
     parser.add_argument('--use_open_model_api', action = 'store_true', help='use APIs instead of local model for open models')
+    parser.add_argument('--log_graphs', action='store_true', help='save the contradiction graph of every question (graph/MIS/sampleMIS) to <run_dir>/graphs/<LOG_NAME>.jsonl')
     parser.add_argument('--run_dir', type=str, default='.', help='base directory under which log/, output/, result/, cache/ are created (e.g. runs3)')
 
     args = parser.parse_args()
@@ -82,6 +84,12 @@ def main():
     logger.info(args)
 
     data_tool = load_data(args.dataset_name,args.top_k)
+
+    if args.log_graphs:
+        if args.defense_method in ['graph', 'MIS', 'sampleMIS']:
+            graph_logger.configure(os.path.join(run_dir, 'graphs', f'{LOG_NAME}.jsonl'))
+        else:
+            logger.info(f'--log_graphs ignored: defense {args.defense_method} builds no contradiction graph')
 
     if args.use_cache: # use/save cached responses from LLM
         os.makedirs(cache_dir,exist_ok=True)
@@ -205,6 +213,7 @@ def main():
                 # data_item = attacker.attack_adaptive(data_item)
 
             # APPLY DEFENSE
+            graph_logger.begin_item(rep_idx, data_idx, data_item)
             start_time = time.perf_counter()
             llm.reset_token_count()
             if args.defense_method == "none":
@@ -229,6 +238,9 @@ def main():
             if not no_attack:
                 asr = data_tool.eval_response_asr(final_response, data_item)
                 asr_cnt += asr
+
+            graph_logger.end_item(final_answer=final_response, correct=corr,
+                                  attack_success=None if no_attack else asr)
 
             # get asr and corr before llm-judge post-processing (for astuterag and instructrag)
             initial_corr_cnt += data_tool.eval_response(response, data_item)
