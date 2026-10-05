@@ -12,6 +12,7 @@ from src.attack import *
 from src.helper import get_log_name
 from src.sampleMIS import *
 from src import graph_logger
+from src import trace_logger
 import matplotlib.pyplot as plt
 import pandas as pd
 from llm_judge import LLMJudge
@@ -54,6 +55,7 @@ def parse_args():
     parser.add_argument('--max_samples', type=int, default=None, help='limit maximum number of samples to run for testing') 
     parser.add_argument('--use_open_model_api', action = 'store_true', help='use APIs instead of local model for open models')
     parser.add_argument('--log_graphs', action='store_true', help='save the contradiction graph of every question (graph/MIS/sampleMIS) to <run_dir>/graphs/<LOG_NAME>.jsonl')
+    parser.add_argument('--save_traces', action='store_true', help='save every LLM call (query -> thinking -> output) per question to <run_dir>/traces/<LOG_NAME>.jsonl; render with scripts/render_traces.py. Run without --use_cache so the thinking is captured')
     parser.add_argument('--run_dir', type=str, default='.', help='base directory under which log/, output/, result/, cache/ are created (e.g. runs3)')
 
     args = parser.parse_args()
@@ -90,6 +92,11 @@ def main():
             graph_logger.configure(os.path.join(run_dir, 'graphs', f'{LOG_NAME}.jsonl'))
         else:
             logger.info(f'--log_graphs ignored: defense {args.defense_method} builds no contradiction graph')
+
+    if args.save_traces:
+        trace_logger.configure(os.path.join(run_dir, 'traces', f'{LOG_NAME}.jsonl'))
+        if args.use_cache:
+            logger.warning('--save_traces with --use_cache: cached answers carry no thinking trace')
 
     if args.use_cache: # use/save cached responses from LLM
         os.makedirs(cache_dir,exist_ok=True)
@@ -214,6 +221,7 @@ def main():
 
             # APPLY DEFENSE
             graph_logger.begin_item(rep_idx, data_idx, data_item)
+            trace_logger.begin_item(rep_idx, data_idx, data_item, defense=args.defense_method)
             start_time = time.perf_counter()
             llm.reset_token_count()
             if args.defense_method == "none":
@@ -240,6 +248,8 @@ def main():
                 asr_cnt += asr
 
             graph_logger.end_item(final_answer=final_response, correct=corr,
+                                  attack_success=None if no_attack else asr)
+            trace_logger.end_item(final_answer=final_response, correct=corr,
                                   attack_success=None if no_attack else asr)
 
             # get asr and corr before llm-judge post-processing (for astuterag and instructrag)

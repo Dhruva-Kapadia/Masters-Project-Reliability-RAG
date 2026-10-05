@@ -12,6 +12,7 @@ temp/
 log
 log_old
 output_old
+runs*/
 # old figure dirs (legacy)
 figs_accuracy
 figs_robustness

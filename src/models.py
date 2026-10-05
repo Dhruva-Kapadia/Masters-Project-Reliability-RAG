@@ -20,6 +20,7 @@ import json
 import time
 import joblib
 from .prompt_template import *
+from . import trace_logger
 
 # for question-answering
 MAX_NEW_TOKENS = 50
@@ -112,10 +113,13 @@ class BaseModel:
         if self.use_cache: # use cache if cache hits
             result = self.query_from_cache(prompt)
             if len(result)>0:
+                trace_logger.record_call(prompt, result, cached=True)
                 return result
 
         # otherwise, do normal LLM query
         result = self._query(prompt)
+        if not getattr(self, '_traces_itself', False):
+            trace_logger.record_call(prompt, result)
 
         # store the response to self.cache
         if self.use_cache:
@@ -129,11 +133,24 @@ class BaseModel:
         if self.use_cache: # use cache if cache hits
             results = self.batch_query_from_cache(prompt_list)
             if len(results)>0:
+                for i, (p, r) in enumerate(zip(prompt_list, results)):
+                    trace_logger.set_stage('per_doc', i)
+                    trace_logger.record_call(p, r, cached=True)
+                trace_logger.set_stage(None)
                 return results
 
         # otherwise, do normal LLM batch query
 
-        results = self._batch_query(prompt_list)
+        trace_logger.set_stage('per_doc')
+        try:
+            results = self._batch_query(prompt_list)
+        finally:
+            trace_logger.set_stage(None)
+        if not getattr(self, '_traces_itself', False):
+            for i, (p, r) in enumerate(zip(prompt_list, results)):
+                trace_logger.set_stage('per_doc', i)
+                trace_logger.record_call(p, r)
+            trace_logger.set_stage(None)
 
         # store the response to self.cache
         if self.use_cache:
@@ -460,6 +477,21 @@ class SharedVLLMModel(BaseModel):
         self.max_output_tokens = 2048 if max_output_tokens is None else max_output_tokens
         if server_file:  # optional explicit config path override
             os.environ["VLLM_CONNECTION_CONFIG"] = server_file
+        self._traces_itself = True  # _query records prompt / thinking / output itself
+        # optional: "low" | "medium" | "high" (gpt-oss reasoning effort); None = server default
+        self.reasoning_effort = os.environ.get("GPTOSS_REASONING_EFFORT") or None
+
+    @staticmethod
+    def _extract_reasoning(msg):
+        """vLLM exposes gpt-oss's analysis channel as `reasoning_content`
+        (older builds) or `reasoning` (newer builds)."""
+        for field in ("reasoning_content", "reasoning"):
+            val = getattr(msg, field, None)
+            if val is None:
+                val = (getattr(msg, "model_extra", None) or {}).get(field)
+            if val:
+                return val if isinstance(val, str) else str(val)
+        return None
 
     def _base_url(self):
         return load_vllm_connection()["base_url"]
@@ -472,8 +504,15 @@ class SharedVLLMModel(BaseModel):
 
     def _query(self, prompt):
         fallback = "I don't know"
+        t0 = time.perf_counter()
+        trace = {"thinking": None, "finish_reason": None,
+                 "prompt_tokens": None, "completion_tokens": None, "error": None}
+        result = fallback
         try:
             client = self._client()
+            kwargs = {}
+            if self.reasoning_effort:
+                kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
             chat = client.chat.completions.create(
                 model=self.model_name,
                 messages=[
@@ -482,27 +521,41 @@ class SharedVLLMModel(BaseModel):
                 ],
                 temperature=self.temperature,
                 max_tokens=self.max_output_tokens,
+                **kwargs,
             )
-            if chat is None or not chat.choices:
-                return fallback
-            content = chat.choices[0].message.content
-            if not content:
-                return fallback
-            if getattr(chat, "usage", None):
-                self.total_input_tokens += getattr(chat.usage, "prompt_tokens", 0)
-                self.total_output_tokens += getattr(chat.usage, "completion_tokens", 0)
-            return content
+            if chat is not None and chat.choices:
+                msg = chat.choices[0].message
+                trace["finish_reason"] = chat.choices[0].finish_reason
+                content = msg.content
+                thinking = self._extract_reasoning(msg)
+                if thinking is None and content:
+                    # server started without a reasoning parser: split raw harmony text
+                    thinking, content = trace_logger.split_harmony(content)
+                trace["thinking"] = thinking
+                if getattr(chat, "usage", None):
+                    trace["prompt_tokens"] = getattr(chat.usage, "prompt_tokens", 0)
+                    trace["completion_tokens"] = getattr(chat.usage, "completion_tokens", 0)
+                    self.total_input_tokens += trace["prompt_tokens"] or 0
+                    self.total_output_tokens += trace["completion_tokens"] or 0
+                if content:
+                    result = content
         except FileNotFoundError:
             logger.warning("vLLM connection config not found; see CONNECT_TO_SHARED_VLLM.md (set VLLM_CONNECTION_CONFIG).")
-            return fallback
+            trace["error"] = "vllm connection config not found"
         except Exception as exc:
             print("Shared vLLM query failed:", exc)
-            return fallback
+            trace["error"] = repr(exc)
+        trace_logger.record_call(prompt, result, latency_sec=round(time.perf_counter() - t0, 3), **trace)
+        return result
 
     def _batch_query(self, prompt_list):
         # Keep concurrency modest (usage rule: ~8 parallel requests or fewer,
         # GPUs are shared). Sequential calls stay well within that.
-        return [self._query(p) for p in prompt_list]
+        out = []
+        for i, p in enumerate(prompt_list):
+            trace_logger.set_stage('per_doc', i)
+            out.append(self._query(p))
+        return out
 
 
 class TogetherAIModel(BaseModel):

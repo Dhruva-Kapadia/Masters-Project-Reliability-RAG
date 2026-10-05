@@ -61,5 +61,20 @@ python scripts/render_graphs.py runs3/graphs/X.jsonl --csv X.csv     # one summa
 python scripts/render_graphs.py runs3/graphs/X.jsonl --dot dot/ --render svg   # Graphviz files
 ```
 
+### Saving the model's thinking traces (Query -> Thought -> Output)
+Add `--save_traces` to `main.py`. Every LLM call made while answering a question (the per-document
+answers, sampled-subset answers, keyword-hint / final aggregation query) is appended to
+`<run_dir>/traces/<LOG_NAME>.jsonl` with the exact prompt, the model's reasoning (gpt-oss analysis channel,
+read from vLLM's `reasoning_content` / `reasoning` field) and the visible output, plus the retrieved
+contexts, poisoned ranks, final answer and grade. Run **without** `--use_cache` (cached answers have no
+reasoning). `GPTOSS_REASONING_EFFORT=low|medium|high` optionally sets gpt-oss reasoning effort.
+```
+python main.py --model_name gpt-oss-120b --dataset_name open_nq --defense_method keyword --gamma 0.9 --max_samples 20 --save_traces
+python scripts/render_traces.py traces/<LOG_NAME>.jsonl                  # readable Markdown, one section per question
+python scripts/render_traces.py traces/<LOG_NAME>.jsonl --only attacked  # just the questions the attack won
+python scripts/render_traces.py traces/<LOG_NAME>.jsonl --csv calls.csv  # one row per LLM call
+```
+On Wulver, `sbatch scripts/wulver_trace_demo.slurm` runs a 3-question demo (open_nq, keyword defense, PIA attack, top-5) and prints the rendered traces into `log/slurm-trace-<jobid>.out`; override with e.g. `sbatch --export=ALL,MAX_SAMPLES=5,DEFENSE=sampleMIS,ATTACK=none scripts/wulver_trace_demo.slurm`.
+
 ### Acknowledgements
 This repository builds upon and was adapted from the upstream RobustRAG codebase maintained by inspire-group. See the original repository: [inspire-group/RobustRAG](https://github.com/inspire-group/RobustRAG).
