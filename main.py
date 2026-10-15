@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import json
 from tqdm import tqdm
 import torch
@@ -11,8 +12,9 @@ from src.baselines import *
 from src.attack import *
 from src.helper import get_log_name
 from src.sampleMIS import *
-from src import graph_logger
-from src import trace_logger
+from src import json_trace_log
+from datetime import datetime
+import platform
 import matplotlib.pyplot as plt
 import pandas as pd
 from llm_judge import LLMJudge
@@ -24,7 +26,7 @@ def parse_args():
 
     # LLM settings
     parser.add_argument("--local_rank", type=int, default=0, help="Local rank passed from distributed launcher")
-    parser.add_argument('--model_name', type=str, default='mistral7b',choices=['mistral7b', 'llama3b', 'gpt-4o', 'gpt-4o-mini', 'o1-mini', 'deepseek7b', 'llama1b', 'tai_llama8b','tai_mistral7b', 'gpt-oss-120b'],help='model name')
+    parser.add_argument('--model_name', type=str, default='mistral7b',choices=['mistral7b', 'llama3b', 'gpt-4o', 'gpt-4o-mini', 'o1-mini', 'deepseek7b', 'llama1b', 'tai_llama8b','tai_mistral7b', 'gpt-oss-120b', 'qwen2.5-32b', 'gpt-oss-120b-local', 'gpt-oss-120b-groq'],help='model name')
     parser.add_argument('--dataset_name', type=str, default='realtimeqa', help='dataset name')    
     parser.add_argument('--model_dir', type=str, help='directory for huggingface models')
     parser.add_argument('--rep', type=int, default=1, help='number of times to repeat querying')
@@ -54,16 +56,25 @@ def parse_args():
     parser.add_argument('--use_cache', action = 'store_true', help='save/use cache responses from LLM')
     parser.add_argument('--max_samples', type=int, default=None, help='limit maximum number of samples to run for testing') 
     parser.add_argument('--use_open_model_api', action = 'store_true', help='use APIs instead of local model for open models')
-    parser.add_argument('--log_graphs', action='store_true', help='save the contradiction graph of every question (graph/MIS/sampleMIS) to <run_dir>/graphs/<LOG_NAME>.jsonl')
-    parser.add_argument('--save_traces', action='store_true', help='save every LLM call (query -> thinking -> output) per question to <run_dir>/traces/<LOG_NAME>.jsonl; render with scripts/render_traces.py. Run without --use_cache so the thinking is captured')
     parser.add_argument('--run_dir', type=str, default='.', help='base directory under which log/, output/, result/, cache/ are created (e.g. runs3)')
 
     args = parser.parse_args()
     return args
 
 def main():
+    # Never crash on printing a dataset character the console encoding can't
+    # represent (e.g. Windows cp1252 when output is redirected).
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(errors='backslashreplace')
     print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU")
     args = parse_args()
+    if args.model_name == 'gpt-oss-120b-groq':
+        # Local Groq runs can't reach the Wulver server the grader and LLM
+        # judge use by default, so grade/judge with Groq's gpt-oss-120b too.
+        # An explicit GRADER_BACKEND/JUDGE_BACKEND in the environment still wins.
+        os.environ.setdefault('GRADER_BACKEND', 'groq')
+        os.environ.setdefault('JUDGE_BACKEND', 'groq')
     LOG_NAME = get_log_name(args)
     logging_level = logging.DEBUG if args.debug else logging.INFO
 
@@ -81,22 +92,11 @@ def main():
 
     logger = logging.getLogger('RRAG-main')
     logger.setLevel(level=logging_level)
-    logger.addHandler(logging.FileHandler(os.path.join(log_dir, f"{LOG_NAME}.log")))
+    logger.addHandler(logging.FileHandler(os.path.join(log_dir, f"{LOG_NAME}.log"), encoding="utf-8"))
 
     logger.info(args)
 
     data_tool = load_data(args.dataset_name,args.top_k)
-
-    if args.log_graphs:
-        if args.defense_method in ['graph', 'MIS', 'sampleMIS']:
-            graph_logger.configure(os.path.join(run_dir, 'graphs', f'{LOG_NAME}.jsonl'))
-        else:
-            logger.info(f'--log_graphs ignored: defense {args.defense_method} builds no contradiction graph')
-
-    if args.save_traces:
-        trace_logger.configure(os.path.join(run_dir, 'traces', f'{LOG_NAME}.jsonl'))
-        if args.use_cache:
-            logger.warning('--save_traces with --use_cache: cached answers carry no thinking trace')
 
     if args.use_cache: # use/save cached responses from LLM
         os.makedirs(cache_dir,exist_ok=True)
@@ -119,6 +119,12 @@ def main():
     elif args.defense_method == 'keyword': # weighted keyword aggregation
         model = WeightedKeywordAgg(llm, relative_threshold=args.alpha, absolute_threshold=args.beta, gamma=args.gamma, longgen=longgen) 
     elif args.defense_method == 'decoding':
+        if not hasattr(llm, 'model'):
+            raise SystemExit(
+                f"--defense_method decoding needs a locally loaded HuggingFace model "
+                f"(it reads token-level probabilities during generation); "
+                f"'{args.model_name}' is an API model. Use a local model such as mistral7b/llama3b "
+                f"without --use_open_model_api, or pick another defense.")
         if args.eta>0 and not longgen:
             logger.warning(f"using non-zero eta {args.eta} for QA")
         model = WeightedDecodingAgg(llm, eta=args.eta, gamma=args.gamma)
@@ -173,6 +179,61 @@ def main():
     if args.max_samples is not None:
         data_list = data_list[:args.max_samples]
 
+    # THINKING-TRACE JSON LOG: run arguments and config at the top, then one
+    # entry per processed query (see src/json_trace_log.py)
+    grader = getattr(data_tool, 'grader', None)
+    trace_config = {
+        "log_name": LOG_NAME,
+        "started_at": datetime.now().astimezone().isoformat(timespec='seconds'),
+        "host": platform.node(),
+        "paths": {
+            "run_dir": run_dir,
+            "text_log": os.path.join(log_dir, f"{LOG_NAME}.log"),
+            "trace_log": os.path.join(log_dir, f"{LOG_NAME}.traces.json"),
+            "output_csv": os.path.join(output_dir, f"{LOG_NAME}.csv"),
+            "cache": cache_path,
+        },
+        "model": {
+            "name": args.model_name,
+            "model_id": getattr(llm, 'model_name', None),
+            "backend_class": type(llm).__name__,
+            "temperature": getattr(llm, 'temperature', None),
+            "max_output_tokens": getattr(llm, 'max_output_tokens', None),
+            "reasoning_logged": bool(getattr(llm, 'log_reasoning', False)),
+        },
+        "defense": {
+            "method": args.defense_method,
+            "class": type(model).__name__,
+            "top_k": args.top_k,
+            "gamma": args.gamma,
+            "T": args.T, "m": args.m,
+            "alpha": args.alpha, "beta": args.beta, "eta": args.eta,
+            "nli_error_prob": args.err,
+            "nli_model": NLI_MODEL if args.defense_method in ['graph', 'MIS', 'sampleMIS'] else None,
+            "contradiction_threshold": 0.5 if args.defense_method in ['graph', 'MIS', 'sampleMIS'] else None,
+        },
+        "attack": {
+            "method": args.attack_method,
+            "enabled": not no_attack,
+            "position": args.attackpos,
+            "corruption_size": args.corruption_size,
+        },
+        "dataset": {
+            "name": args.dataset_name,
+            "path": getattr(data_tool, 'data_path', None),
+            "num_available": len(data_tool.data),
+            "num_queries": len(data_list),
+            "reps": args.rep,
+        },
+        "grader": {"backend": getattr(grader, 'backend', None), "model": getattr(grader, 'model', None)},
+        "llm_judge": ({"backend": os.environ.get("JUDGE_BACKEND", "shared_vllm")}
+                      if args.defense_method in ['astuterag', 'instructrag_icl'] else None),
+        "env": {k: os.environ.get(k) for k in ["GRADER_BACKEND", "JUDGE_BACKEND", "NLI_MODEL",
+                                               "SAMPLING_EMBEDDER", "LOG_REASONING_MAX_CHARS"]
+                if os.environ.get(k) is not None},
+    }
+    json_trace_log.configure(os.path.join(log_dir, f"{LOG_NAME}.traces.json"), vars(args), trace_config)
+
     os.makedirs(output_dir,exist_ok=True)
     output_csv_file = os.path.join(output_dir, f"{LOG_NAME}.csv")
     fieldnames = [
@@ -192,7 +253,7 @@ def main():
         "dataset_name",
         "dataset_size",        
     ]
-    with open(output_csv_file, mode='w', newline='') as f:
+    with open(output_csv_file, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
     llm_judge = LLMJudge() if args.defense_method in ['astuterag', 'instructrag_icl'] else None
@@ -220,8 +281,7 @@ def main():
                 # data_item = attacker.attack_adaptive(data_item)
 
             # APPLY DEFENSE
-            graph_logger.begin_item(rep_idx, data_idx, data_item)
-            trace_logger.begin_item(rep_idx, data_idx, data_item, defense=args.defense_method)
+            json_trace_log.begin_query(rep_idx, data_idx, data_item)
             start_time = time.perf_counter()
             llm.reset_token_count()
             if args.defense_method == "none":
@@ -241,16 +301,25 @@ def main():
             else:
                 final_response = response
 
+            if grader is not None:
+                grader.last_grade = None
             corr = data_tool.eval_response(final_response, data_item)
+            grade_info = (getattr(grader, 'last_grade', None) or {}) if grader is not None else {}
             corr_cnt += corr
+            asr = None
             if not no_attack:
                 asr = data_tool.eval_response_asr(final_response, data_item)
                 asr_cnt += asr
 
-            graph_logger.end_item(final_answer=final_response, correct=corr,
-                                  attack_success=None if no_attack else asr)
-            trace_logger.end_item(final_answer=final_response, correct=corr,
-                                  attack_success=None if no_attack else asr)
+            json_trace_log.set_judgment(
+                correct=corr,
+                grade=grade_info.get("grade"),
+                grader_prompt=grade_info.get("prompt"),
+                grader_thinking=grade_info.get("thinking"),
+                attack_success=asr,
+                extracted_answer=final_response if llm_judge is not None else None,
+                judge_thinking=getattr(llm_judge, 'last_thinking', None) if llm_judge is not None else None)
+            json_trace_log.end_query(final_answer=response)
 
             # get asr and corr before llm-judge post-processing (for astuterag and instructrag)
             initial_corr_cnt += data_tool.eval_response(response, data_item)
@@ -278,7 +347,7 @@ def main():
         # save for later analysis, currently used for biogen dataset 
         if args.save_response:
             os.makedirs(result_dir,exist_ok=True)
-            with open(os.path.join(result_dir, f'{LOG_NAME}.json'),'w') as f:
+            with open(os.path.join(result_dir, f'{LOG_NAME}.json'),'w', encoding='utf-8') as f:
                 json.dump(response_list,f,indent=4)
 
         if args.use_cache:
@@ -303,6 +372,7 @@ def main():
         }
         df = pd.DataFrame([result_current])
         df.to_csv(output_csv_file, mode='a', header=False, index=False)
+        json_trace_log.add_summary(result_current)
 
 if __name__ == '__main__':
     main()

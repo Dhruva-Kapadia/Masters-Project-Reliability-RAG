@@ -22,18 +22,18 @@ def get_log_name(args):
 
 def load_jsonl(file_path):
     results = []
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:  # This avoids loading all lines into memory at once
             results.append(json.loads(line))
     return results
 
 
 def save_json(file,file_path):
-    with open(file_path, 'w') as g:
+    with open(file_path, 'w', encoding='utf-8') as g:
         g.write(json.dumps(file, indent=4))
 
 def load_json(file_path):
-    with open(file_path) as file:
+    with open(file_path, encoding='utf-8') as file:
         results = json.load(file)
     return results
 

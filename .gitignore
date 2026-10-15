@@ -13,6 +13,7 @@ log
 log_old
 output_old
 runs*/
+local_runs/
 # old figure dirs (legacy)
 figs_accuracy
 figs_robustness

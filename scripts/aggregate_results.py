@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Concatenate all per-config CSVs for one run into a single summary table.
+"""Concatenate all per-config CSVs for one run into a single summary table,
+and plot them (accuracy / ASR / robustness / cost PNGs + results_table.md in
+<output_dir>/plots/, see scripts/plot_results.py; --no_plots to skip).
 
 Usage:
     uv run python scripts/aggregate_results.py --run_dir runs3
     # or, to point directly at a csv directory:
     uv run python scripts/aggregate_results.py --output_dir runs3/output --out runs3/output/summary.csv
-
-Also draws the benchmark figure (scripts/plot_benchmark.py) as benchmark.png in the
-same folder as summary.csv; pass --no_plot to skip it or --plot_out to rename it.
 """
 import argparse
 import glob
@@ -21,8 +20,7 @@ def main():
     ap.add_argument('--run_dir', default=None, help='runsN directory; sets output_dir=<run_dir>/output and out=<run_dir>/output/summary.csv unless overridden')
     ap.add_argument('--output_dir', default=None)
     ap.add_argument('--out', default=None)
-    ap.add_argument('--no_plot', action='store_true', help='skip the benchmark figure')
-    ap.add_argument('--plot_out', default=None, help='figure path (default: benchmark.png next to --out)')
+    ap.add_argument('--no_plots', action='store_true', help='skip writing plots to <output_dir>/plots/')
     args = ap.parse_args()
 
     if args.run_dir is not None:
@@ -56,14 +54,13 @@ def main():
     cols = ['dataset_name', 'defense_method', 'attack_method', 'acc', 'asr', 'dataset_size']
     print(summary[cols].to_string(index=False))
 
-    if not args.no_plot:
+    if not args.no_plots:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        from plot_benchmark import plot_summary
-        plot_out = args.plot_out or os.path.join(os.path.dirname(os.path.abspath(args.out)), 'benchmark.png')
-        try:
-            plot_summary(args.out, plot_out)
-        except Exception as e:  # never lose the summary because of a plotting problem
-            print(f"Plot failed ({e}); summary.csv is still written. Retry: python scripts/plot_benchmark.py {args.out}")
+        from plot_results import load, make_plots
+        df = load(files)
+        if df is not None:
+            for p in make_plots(df, os.path.join(args.output_dir, 'plots')):
+                print(f"wrote {p}")
 
 
 if __name__ == '__main__':

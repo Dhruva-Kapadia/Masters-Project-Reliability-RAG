@@ -3,11 +3,22 @@ import re
 import logging
 from openai import OpenAI
 
+from src.reasoning_log import log_reasoning
+
 logger = logging.getLogger('RRAG-main')
 
-# Shared gpt-oss-120b vLLM server details come from the connection config
-# (see CONNECT_TO_SHARED_VLLM.md and src/vllm_config.py).
-from src.vllm_config import make_client as make_vllm_client
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
+def _groq_client():
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is not set")
+    return OpenAI(base_url=os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+                  api_key=key, max_retries=int(os.environ.get("GROQ_MAX_RETRIES", "8")), timeout=120)
+
 
 judge_prompt = '''Here is the complete answer:
 
@@ -62,7 +73,9 @@ class LLMJudge(object):
 
     By default this talks to the shared gpt-oss-120b vLLM server on Wulver
     (no API key needed). Set JUDGE_BACKEND=openai (and OPENAI_API_KEY) to use
-    a real OpenAI model instead, e.g. when not running on Wulver.
+    a real OpenAI model instead, or JUDGE_BACKEND=groq (and GROQ_API_KEY) for
+    Groq's gpt-oss-120b -- main.py selects groq automatically for
+    --model_name gpt-oss-120b-groq.
     """
     def __init__(self):
         self.backend = os.environ.get("JUDGE_BACKEND", "shared_vllm")
@@ -70,16 +83,24 @@ class LLMJudge(object):
             self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
             self.model = "gpt-4o"
             self.max_tokens = 1000
+        elif self.backend == "groq":
+            self.client = _groq_client()
+            self.model = "openai/gpt-oss-120b"
+            self.max_tokens = 2048  # reasoning model, see shared_vllm branch
         else:
+            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
             self.model = "openai/gpt-oss-120b"
             # gpt-oss is a reasoning model: its hidden reasoning shares the
             # max_tokens budget, so this needs more headroom than gpt-4o did.
             self.max_tokens = 2048
+        self.last_thinking = None  # reasoning of the latest judge() call
 
     def _client(self):
-        if self.backend == "openai":
+        if self.backend in ("openai", "groq"):
             return self.client
-        return make_vllm_client()  # re-reads the connection config each call
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
 
     def judge(self, question, answer):
         final_prompt = judge_prompt.format(question=question, answer=answer)
@@ -90,6 +111,7 @@ class LLMJudge(object):
 
     def get_gpt_output(self, model, prompt, temperature=0):
         messages = [{"role": "user", "content": prompt}]
+        self.last_thinking = None
         try:
             client = self._client()
             response = client.chat.completions.create(
@@ -98,6 +120,8 @@ class LLMJudge(object):
                 max_tokens=self.max_tokens,
                 top_p=0.5,
                 messages=messages)
+            if 'gpt-oss' in model:
+                self.last_thinking = log_reasoning("judge", model, prompt, response)
             return response.choices[0].message.content
         except Exception as e:
             logger.warning(f"LLM Judge error getting output: {e}")

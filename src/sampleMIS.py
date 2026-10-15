@@ -6,8 +6,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import numpy as np
 from src.defense import *
-from src.nli_config import load_nli
-from src import graph_logger
+from src import json_trace_log
 import time
 import random
 
@@ -56,7 +55,7 @@ class SampleMISRRAG(RRAG):
         num_samples: int = 10,
         gamma: float = 1.0,
         err: float = 0.0,
-        nli_model_path: str = None,  # None -> src.nli_config.NLI_MODEL
+        nli_model_path: str = None,  # default: NLI_MODEL from src/defense.py
         contradiction_threshold: float = 0.5,
     ):
         super().__init__(llm)
@@ -67,7 +66,11 @@ class SampleMISRRAG(RRAG):
         self.err = err
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.nli_tok, self.nli, self.contra_idx = load_nli(nli_model_path, device=device)
+        nli_model_path = nli_model_path or NLI_MODEL
+        self.nli_tok = AutoTokenizer.from_pretrained(nli_model_path)
+        self.nli     = AutoModelForSequenceClassification.from_pretrained(
+            nli_model_path
+        ).to(device)
 
     # ───────────────────────── main entry ─────────────────────────
     def query(self, data_item: Dict[str, Any]) -> str:
@@ -117,10 +120,13 @@ class SampleMISRRAG(RRAG):
         end_time = time.perf_counter()
         print("time for getting separate responses: ", end_time - start_time)
         print(answers)
+        # each sampled subset is one context item (its docs, 0-based ranks)
+        json_trace_log.log_context_reasoning(
+            sample_sets, prompts, answers,
+            extra=[{'context_doc_indices': [int(r) - 1 for r in rk]} for rk in ranks])
 
         graph = {i: set() for i in range(self.num_samples)}
         premises, hypotheses, pairs = [], [], []
-        pair_log = [] # every scored pair of samples, for graph_logger
         for i, j in combinations(range(self.num_samples), 2):
             premise = (
                 f"The answer to the question: {data_item['question']}\n"
@@ -142,7 +148,7 @@ class SampleMISRRAG(RRAG):
             start_time = time.perf_counter()
             with torch.no_grad():
                 logits = self.nli(**inputs).logits
-            probs = torch.softmax(logits, dim=1)[:, self.contra_idx]   # CONTRADICTION
+            probs = torch.softmax(logits, dim=1)[:, 2]   # CONTRADICTION
             end_time = time.perf_counter()
             print("time for NLI: ", end_time - start_time)
             for p, (i, j) in zip(probs.tolist(), pairs):
@@ -156,9 +162,6 @@ class SampleMISRRAG(RRAG):
                         if x <= self.err:
                             graph[i].add(j)
                             graph[j].add(i)    
-                is_edge = j in graph[i]
-                nli_edge = p >= self.thres and "I don't know" not in answers[i] and "I don't know" not in answers[j]
-                pair_log.append({'i': i, 'j': j, 'p_contra': p, 'edge': is_edge, 'flipped': is_edge != nli_edge})
                 # if p >= self.thres and "I don't know" not in answers[i] and "I don't know" not in answers[j]:
                 #     graph[i].add(j)
                 #     graph[j].add(i)
@@ -172,16 +175,12 @@ class SampleMISRRAG(RRAG):
         mis_doc_idxs = [idx - 1 for s in mis_set_idx for idx in ranks[s] if "I don't know" not in answers[s]]
         mis_docs = [docs[i] for i in mis_doc_idxs]
         logger.info(f"MIS document indices: {mis_doc_idxs}")
-
-        graph_logger.record(
-            'sampleMIS',
-            # nodes are the T samples; doc_ranks are the 0-based ranks drawn into each
-            nodes=[{'id': s, 'doc_ranks': [r - 1 for r in ranks[s]], 'answer': answers[s],
-                    'idk': "I don't know" in answers[s]} for s in range(self.num_samples)],
-            pairs=pair_log, selected=mis_set_idx, final_doc_ranks=mis_doc_idxs,
-            threshold=self.thres, err=self.err,
-            extra={'sample_size': self.sample_size, 'num_samples': self.num_samples,
-                   'gamma': self.gamma, 'doc_sampling_prob': [round(float(w), 4) for w in weights]})
+        json_trace_log.log_graph(
+            'sampleMIS', nodes=range(self.num_samples),
+            edges=[(i, j) for i in graph for j in graph[i] if i < j],
+            cluster=mis_set_idx, directed=False,
+            idk_nodes=[i for i in range(self.num_samples) if "I don't know" in answers[i]],
+            final_doc_indices=[int(i) for i in mis_doc_idxs])
 
         final_item = copy.deepcopy(data_item)
         final_item["topk_content"] = mis_docs
@@ -192,6 +191,7 @@ class SampleMISRRAG(RRAG):
         )
         start_time = time.perf_counter()
         final_answer = self.llm.query(query_prompt)
+        json_trace_log.log_final(query_prompt, final_answer, all_answers=answers)
         end_time = time.perf_counter()
         print("time for the ultimate query: ", end_time - start_time)
         print(final_answer)

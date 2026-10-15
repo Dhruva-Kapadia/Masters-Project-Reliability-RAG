@@ -1,4 +1,5 @@
 from .helper import load_json,clean_str
+from .reasoning_log import log_reasoning
 import logging
 import os, re, json
 
@@ -87,9 +88,19 @@ Just return the letters "A", "B", or "C", with no text around it.
 """.strip()
 CHOICE_TO_METRIC = {"A": "is_correct", "B": "is_incorrect", "C": "is_not_attempted"}
 
-# Shared gpt-oss-120b vLLM server details come from the connection config
-# (see CONNECT_TO_SHARED_VLLM.md and src/vllm_config.py).
-from .vllm_config import make_client as make_vllm_client
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). Kept in sync with src/models.py's default.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
+
+def _groq_client():
+    from openai import OpenAI
+    key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        raise RuntimeError("GROQ_API_KEY is not set")
+    return OpenAI(base_url=os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1"),
+                  api_key=key, max_retries=int(os.environ.get("GROQ_MAX_RETRIES", "8")), timeout=120)
 
 
 # ====================  GRADER  =========================
@@ -98,12 +109,15 @@ class SandboxGrader:
 
     By default this talks to the shared gpt-oss-120b vLLM server on Wulver
     (no API key needed). Set GRADER_BACKEND=openai (and OPENAI_API_KEY) to
-    grade with a real OpenAI model instead, e.g. when not running on Wulver.
+    grade with a real OpenAI model instead, or GRADER_BACKEND=groq (and
+    GROQ_API_KEY) for Groq's gpt-oss-120b -- main.py selects groq automatically
+    for --model_name gpt-oss-120b-groq.
     """
     def __init__(self, model_name: str = None, temperature: float = 0., backend: str = None):
         self.backend = backend or os.environ.get("GRADER_BACKEND", "shared_vllm")
         self.temperature = temperature
         self._match_re = re.compile(r"[ABC]")
+        self.last_grade = None  # {prompt, grade, thinking} of the latest grade() call
 
         if self.backend == "openai":
             from openai import OpenAI
@@ -111,8 +125,13 @@ class SandboxGrader:
             self.model = model_name or "gpt-4o"
             # a single letter is enough for a non-reasoning OpenAI chat model
             self.max_tokens = 1
+        elif self.backend == "groq":
+            self.client = _groq_client()
+            self.model = model_name or "openai/gpt-oss-120b"
+            self.max_tokens = 2048  # reasoning model, see shared_vllm branch
         else:
             from openai import OpenAI
+            self.server_file = os.environ.get("SHARED_VLLM_SERVER_FILE", SHARED_VLLM_SERVER_FILE)
             self.client = None  # built lazily per-call in grade(), see _client()
             self.model = model_name or "openai/gpt-oss-120b"
             # gpt-oss is a reasoning model: its hidden reasoning shares the
@@ -121,15 +140,19 @@ class SandboxGrader:
             self.max_tokens = 2048
 
     def _client(self):
-        if self.backend == "openai":
+        if self.backend in ("openai", "groq"):
             return self.client
-        return make_vllm_client()  # re-reads the connection config each call
+        from openai import OpenAI
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return OpenAI(base_url=f"http://{node_port}/v1", api_key="dummy")
 
     def grade(self, question: str, target: str, predicted: str) -> str:
         prompt = GRADER_TEMPLATE.format(question=question,
                                         target=target,
                                         predicted_answer=predicted)
         prompt += "\n\nRespond with only a single letter: A, B, or C."
+        thinking = None
         try:
             client = self._client()
             chat = client.chat.completions.create(
@@ -137,12 +160,16 @@ class SandboxGrader:
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=self.max_tokens,
                 temperature=self.temperature)
+            if 'gpt-oss' in self.model:
+                thinking = log_reasoning("grader", self.model, prompt, chat)
             content = chat.choices[0].message.content
         except Exception as exc:
             logger.warning(f"Grader query failed: {exc}")
             content = None
         m = self._match_re.search(content or "")
-        return m.group(0) if m else "C"
+        grade = m.group(0) if m else "C"
+        self.last_grade = {"prompt": prompt, "grade": grade, "thinking": thinking}
+        return grade
 
 
 class DataUtils: # base class for dataset

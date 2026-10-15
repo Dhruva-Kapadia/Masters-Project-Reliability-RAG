@@ -11,6 +11,9 @@ from torch import LongTensor, FloatTensor
 import logging
 logger = logging.getLogger('RRAG-main')
 
+from .reasoning_log import log_reasoning, usage_dict
+from . import json_trace_log
+
 import litellm
 from litellm import batch_completion
 from litellm.exceptions import RateLimitError
@@ -20,7 +23,6 @@ import json
 import time
 import joblib
 from .prompt_template import *
-from . import trace_logger
 
 # for question-answering
 MAX_NEW_TOKENS = 50
@@ -36,13 +38,35 @@ CONTEXT_MAX_TOKENS = {'Mistral-7B-Instruct-v0.2': 8192,
                       'gpt-4o':8192,
                       'o1-mini':8192,
                       'vicuna-7b-v1.5': 4096,
-                      'openai/gpt-oss-120b': 32768}
+                      'openai/gpt-oss-120b': 32768,
+                      'Qwen/Qwen2.5-32B-Instruct': 32768}
 
-# Connection details for the shared gpt-oss-120b vLLM server on Wulver come
-# from the connection config (see CONNECT_TO_SHARED_VLLM.md and
-# src/vllm_config.py). It is re-read on every request, so moving the server
-# only means editing that file.
-from .vllm_config import load_connection as load_vllm_connection
+# Location file for the shared gpt-oss-120b vLLM server on Wulver (see
+# CONNECT_TO_SHARED_VLLM.md). The node:port changes whenever the server is
+# restarted, so we always read this file fresh rather than caching the value.
+SHARED_VLLM_SERVER_FILE = os.environ.get(
+    "SHARED_VLLM_SERVER_FILE", "/project/ss797/ap2645/vllm_server.txt"
+)
+
+# Separate location file for the shared Qwen2.5-32B-Instruct vLLM server
+# (a different server, owned by a different lab member). Same rules: read
+# fresh on every query since the node:port changes on restart.
+QWEN_VLLM_SERVER_FILE = os.environ.get(
+    "QWEN_VLLM_SERVER_FILE", "/project/ss797/cs757/KidnapRAG/vllm_server.txt"
+)
+
+# Address file published by scripts/serve_gpt_oss_local.slurm for a gpt-oss-120b
+# server you run yourself from locally-downloaded weights (your own job, so you
+# control concurrency). Default lives in $HOME so it needs no username.
+LOCAL_VLLM_SERVER_FILE = os.environ.get(
+    "LOCAL_VLLM_SERVER_FILE", os.path.expanduser("~/vllm_local_server.txt")
+)
+
+# Groq's hosted gpt-oss-120b, for testing on your own machine (no Wulver
+# access needed). OpenAI-compatible API; needs GROQ_API_KEY. GROQ_BASE_URL is
+# overridable only for testing against a fake server.
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+GROQ_GPT_OSS_MODEL = "openai/gpt-oss-120b"
 
 
 def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
@@ -70,6 +94,13 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
             return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs)
         elif model_name == 'gpt-oss-120b':
             return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL, **kwargs)
+        elif model_name == 'qwen2.5-32b':
+            return _make_qwen_model(**kwargs)
+        elif model_name == 'gpt-oss-120b-local':
+            return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL,
+                                   server_file=LOCAL_VLLM_SERVER_FILE, **kwargs)
+        elif model_name == 'gpt-oss-120b-groq':
+            return GroqModel(GROQ_GPT_OSS_MODEL, GPT_TMPL, **kwargs)
         else:
             raise NotImplementedError
     else:
@@ -85,8 +116,30 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
             return GPTModel('gpt-4o-mini', GPT_TMPL, **kwargs)
         elif model_name == 'gpt-oss-120b':
             return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL, **kwargs)
+        elif model_name == 'qwen2.5-32b':
+            return _make_qwen_model(**kwargs)
+        elif model_name == 'gpt-oss-120b-local':
+            return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL,
+                                   server_file=LOCAL_VLLM_SERVER_FILE, **kwargs)
+        elif model_name == 'gpt-oss-120b-groq':
+            return GroqModel(GROQ_GPT_OSS_MODEL, GPT_TMPL, **kwargs)
         else:
             raise NotImplementedError
+
+
+def _make_qwen_model(**kwargs):
+    # Qwen2.5-32B-Instruct is a plain (non-reasoning) chat model: greedy
+    # decoding (temperature 0.0, matching the server's example client) and the
+    # repo's standard short-answer budget (MAX_NEW_TOKENS) are appropriate;
+    # callers such as biogen still override max_output_tokens via kwargs.
+    return SharedVLLMModel(
+        'Qwen/Qwen2.5-32B-Instruct', GPT_TMPL,
+        server_file=QWEN_VLLM_SERVER_FILE,
+        temperature=0.0,
+        default_max_output_tokens=MAX_NEW_TOKENS,
+        **kwargs,
+    )
+
 
 class BaseModel:
     def __init__(self,cache_path=None):
@@ -109,17 +162,25 @@ class BaseModel:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
 
+    # key under which a prompt's reasoning trace is kept in self.cache (tuple
+    # keys never collide with the plain-string prompt keys)
+    @staticmethod
+    def _reasoning_key(prompt):
+        return ('__reasoning__', prompt)
+
+    def _record_cache_hit(self, prompt, result):
+        json_trace_log.record_call(prompt, result, thinking=self.cache.get(self._reasoning_key(prompt)),
+                                   cached=True)
+
     def query(self, prompt):
         if self.use_cache: # use cache if cache hits
             result = self.query_from_cache(prompt)
             if len(result)>0:
-                trace_logger.record_call(prompt, result, cached=True)
+                self._record_cache_hit(prompt, result)
                 return result
 
         # otherwise, do normal LLM query
         result = self._query(prompt)
-        if not getattr(self, '_traces_itself', False):
-            trace_logger.record_call(prompt, result)
 
         # store the response to self.cache
         if self.use_cache:
@@ -133,24 +194,13 @@ class BaseModel:
         if self.use_cache: # use cache if cache hits
             results = self.batch_query_from_cache(prompt_list)
             if len(results)>0:
-                for i, (p, r) in enumerate(zip(prompt_list, results)):
-                    trace_logger.set_stage('per_doc', i)
-                    trace_logger.record_call(p, r, cached=True)
-                trace_logger.set_stage(None)
+                for p, r in zip(prompt_list, results):
+                    self._record_cache_hit(p, r)
                 return results
 
         # otherwise, do normal LLM batch query
 
-        trace_logger.set_stage('per_doc')
-        try:
-            results = self._batch_query(prompt_list)
-        finally:
-            trace_logger.set_stage(None)
-        if not getattr(self, '_traces_itself', False):
-            for i, (p, r) in enumerate(zip(prompt_list, results)):
-                trace_logger.set_stage('per_doc', i)
-                trace_logger.record_call(p, r)
-            trace_logger.set_stage(None)
+        results = self._batch_query(prompt_list)
 
         # store the response to self.cache
         if self.use_cache:
@@ -461,58 +511,40 @@ class SharedVLLMModel(BaseModel):
     API (see CONNECT_TO_SHARED_VLLM.md). We do not start or manage the server;
     we just look up where it currently is and send requests to it.
 
-    The server's host/port are read fresh from the connection config on every
+    The server's node:port is read fresh from SHARED_VLLM_SERVER_FILE on every
     query (not cached), since the owner may restart it on a different node at
     any time.
     """
 
     def __init__(self, model_name, prompt_template, cache_path=None, max_output_tokens=None,
-                 server_file=None, **kwargs):
+                 server_file=None, temperature=0.7, default_max_output_tokens=2048, **kwargs):
         super().__init__(cache_path)
         self.model_name = model_name
         self.prompt_template = prompt_template
-        self.temperature = 0.7
-        # gpt-oss is a reasoning model: its hidden reasoning tokens share the
-        # max_tokens budget, so a small value returns empty/truncated answers.
-        self.max_output_tokens = 2048 if max_output_tokens is None else max_output_tokens
-        if server_file:  # optional explicit config path override
-            os.environ["VLLM_CONNECTION_CONFIG"] = server_file
-        self._traces_itself = True  # _query records prompt / thinking / output itself
-        # optional: "low" | "medium" | "high" (gpt-oss reasoning effort); None = server default
-        self.reasoning_effort = os.environ.get("GPTOSS_REASONING_EFFORT") or None
-
-    @staticmethod
-    def _extract_reasoning(msg):
-        """vLLM exposes gpt-oss's analysis channel as `reasoning_content`
-        (older builds) or `reasoning` (newer builds)."""
-        for field in ("reasoning_content", "reasoning"):
-            val = getattr(msg, field, None)
-            if val is None:
-                val = (getattr(msg, "model_extra", None) or {}).get(field)
-            if val:
-                return val if isinstance(val, str) else str(val)
-        return None
+        self.temperature = temperature
+        # Defaults suit gpt-oss, a reasoning model whose hidden reasoning tokens
+        # share the max_tokens budget (a small value returns empty/truncated
+        # answers). Non-reasoning models pass a smaller default_max_output_tokens.
+        self.max_output_tokens = default_max_output_tokens if max_output_tokens is None else max_output_tokens
+        self.server_file = server_file or SHARED_VLLM_SERVER_FILE
+        # gpt-oss returns a reasoning trace with each answer; log it (see
+        # src/reasoning_log.py). Non-reasoning models (Qwen) have none.
+        self.log_reasoning = 'gpt-oss' in model_name
 
     def _base_url(self):
-        return load_vllm_connection()["base_url"]
+        with open(self.server_file, 'r') as f:
+            node_port = f.read().strip()
+        return f"http://{node_port}/v1"
 
     def _client(self):
-        # Rebuilt on every call since the host/port can change if the server
-        # was restarted (the connection config is re-read each time).
-        conn = load_vllm_connection()
-        return OpenAI(base_url=conn["base_url"], api_key=conn["api_key"])
+        # Rebuilt on every call since the node:port can change if the server
+        # was restarted (see SHARED_VLLM_SERVER_FILE handling above).
+        return OpenAI(base_url=self._base_url(), api_key="dummy")
 
     def _query(self, prompt):
         fallback = "I don't know"
-        t0 = time.perf_counter()
-        trace = {"thinking": None, "finish_reason": None,
-                 "prompt_tokens": None, "completion_tokens": None, "error": None}
-        result = fallback
         try:
             client = self._client()
-            kwargs = {}
-            if self.reasoning_effort:
-                kwargs["extra_body"] = {"reasoning_effort": self.reasoning_effort}
             chat = client.chat.completions.create(
                 model=self.model_name,
                 messages=[
@@ -521,41 +553,56 @@ class SharedVLLMModel(BaseModel):
                 ],
                 temperature=self.temperature,
                 max_tokens=self.max_output_tokens,
-                **kwargs,
             )
-            if chat is not None and chat.choices:
-                msg = chat.choices[0].message
-                trace["finish_reason"] = chat.choices[0].finish_reason
-                content = msg.content
-                thinking = self._extract_reasoning(msg)
-                if thinking is None and content:
-                    # server started without a reasoning parser: split raw harmony text
-                    thinking, content = trace_logger.split_harmony(content)
-                trace["thinking"] = thinking
-                if getattr(chat, "usage", None):
-                    trace["prompt_tokens"] = getattr(chat.usage, "prompt_tokens", 0)
-                    trace["completion_tokens"] = getattr(chat.usage, "completion_tokens", 0)
-                    self.total_input_tokens += trace["prompt_tokens"] or 0
-                    self.total_output_tokens += trace["completion_tokens"] or 0
-                if content:
-                    result = content
+            # extracted before the empty-answer fallback, so traces that used up
+            # the whole token budget without answering are still logged
+            thinking = log_reasoning("answer", self.model_name, prompt, chat) if self.log_reasoning else None
+            if thinking and self.use_cache:
+                self.cache[self._reasoning_key(prompt)] = thinking
+            content = chat.choices[0].message.content if chat is not None and chat.choices else None
+            if content and getattr(chat, "usage", None):
+                self.total_input_tokens += getattr(chat.usage, "prompt_tokens", 0)
+                self.total_output_tokens += getattr(chat.usage, "completion_tokens", 0)
+            answer = content if content else fallback
+            json_trace_log.record_call(prompt, answer, thinking=thinking, usage=usage_dict(chat),
+                                       error=None if content else "empty answer (fallback used)")
+            return answer
         except FileNotFoundError:
-            logger.warning("vLLM connection config not found; see CONNECT_TO_SHARED_VLLM.md (set VLLM_CONNECTION_CONFIG).")
-            trace["error"] = "vllm connection config not found"
+            logger.warning(f"Shared vLLM server file not found at {self.server_file}; is the server running?")
+            json_trace_log.record_call(prompt, fallback, error=f"server file not found: {self.server_file}")
+            return fallback
         except Exception as exc:
             print("Shared vLLM query failed:", exc)
-            trace["error"] = repr(exc)
-        trace_logger.record_call(prompt, result, latency_sec=round(time.perf_counter() - t0, 3), **trace)
-        return result
+            json_trace_log.record_call(prompt, fallback, error=f"query failed: {exc}")
+            return fallback
 
     def _batch_query(self, prompt_list):
         # Keep concurrency modest (usage rule: ~8 parallel requests or fewer,
         # GPUs are shared). Sequential calls stay well within that.
-        out = []
-        for i, p in enumerate(prompt_list):
-            trace_logger.set_stage('per_doc', i)
-            out.append(self._query(p))
-        return out
+        return [self._query(p) for p in prompt_list]
+
+
+class GroqModel(SharedVLLMModel):
+    """gpt-oss-120b via Groq's OpenAI-compatible API, for local testing.
+
+    Same request shape and defaults as the shared-server gpt-oss config
+    (temperature 0.7, 2048 max tokens), so local results are comparable; only
+    the endpoint and auth differ. Rate-limit (429) and transient errors are
+    retried with backoff by the OpenAI client itself (honours Retry-After).
+    """
+
+    def __init__(self, model_name, prompt_template, **kwargs):
+        super().__init__(model_name, prompt_template, **kwargs)
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY is not set (export GROQ_API_KEY=... before running)")
+        self.server_file = None  # not used: fixed endpoint
+        self._groq = OpenAI(base_url=GROQ_BASE_URL, api_key=api_key,
+                            max_retries=int(os.environ.get("GROQ_MAX_RETRIES", "8")),
+                            timeout=120)
+
+    def _client(self):
+        return self._groq
 
 
 class TogetherAIModel(BaseModel):

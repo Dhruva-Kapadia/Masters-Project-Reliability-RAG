@@ -30,8 +30,7 @@ from itertools import chain, combinations
 import math
 
 from src.decoding_methods import secure_decoding
-from src.nli_config import load_nli, NLI_MODEL
-from src import graph_logger
+from src import json_trace_log
 
 logger = logging.getLogger('RRAG-main')
 
@@ -40,13 +39,27 @@ INJECTION = True # injection attack. if False, we consider passage modification 
 def save_all_responses(save_path,response_list,data_item):
     all_data = []# it is a bit ugly... unnecessary read and write ; TODO: change it to jsonl instead
     if os.path.exists(save_path) and os.path.getsize(save_path) > 0:
-        with open(save_path,'r') as f:
+        with open(save_path,'r',encoding='utf-8') as f:
             all_data = json.load(f)
     all_data.append({"query":data_item['question'],
                      "answer":data_item['answer'],
                      "response":response_list})
-    with open(save_path,'w') as f:
+    with open(save_path,'w',encoding='utf-8') as f:
         json.dump(all_data,f,indent=4)
+
+
+# NLI model used by graph / MIS / sampleMIS to detect contradicting answers.
+# The authors loaded a local copy from their cluster; this is the same public
+# checkpoint on HuggingFace (label 2 = contradiction). Set NLI_MODEL to a local
+# directory to avoid downloading at run time (e.g. on compute nodes).
+NLI_MODEL = os.environ.get("NLI_MODEL", "MoritzLaurer/DeBERTa-v3-large-mnli-fever-anli-ling-wanli")
+
+# Embedding model for the `sampling` defense's second stage (pick the sampled
+# answer closest to the mean embedding). The authors used OpenAI
+# text-embedding-ada-002. SAMPLING_EMBEDDER=openai keeps that (needs
+# OPENAI_API_KEY); SAMPLING_EMBEDDER=hf uses a local sentence-transformers
+# model instead. Default: openai if OPENAI_API_KEY is set, else hf.
+SAMPLING_HF_MODEL = os.environ.get("SAMPLING_HF_MODEL", "sentence-transformers/all-mpnet-base-v2")
 
 
 class RRAG:
@@ -58,6 +71,7 @@ class RRAG:
         query_prompt = self.llm.wrap_prompt(data_item,as_multi_choice='choices' in data_item)
         #response = None 
         response =  self.llm.query(query_prompt)
+        json_trace_log.log_final(query_prompt, response)
         logger.debug(f'Query_prompt:\n{query_prompt}')
         logger.debug(f'Response:\n{response}')
         logger.debug(f'Answer:\n{data_item["answer"]}')
@@ -82,11 +96,14 @@ class GraphBasedRRAG(RRAG):
         self.llm = llm
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # device = "cpu" # for gpt-4o
-        self.nli_tokenizer, self.nli_model, self.contra_idx = load_nli(device=device)
+        self.nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL).to(device)
 
     def query(self, data_item):
         docs = data_item['topk_content']
-        seperate_responses = self.llm.batch_query(self.llm.wrap_prompt(data_item,as_multi_choice='choices' in data_item,seperate=True))
+        seperate_prompts = self.llm.wrap_prompt(data_item,as_multi_choice='choices' in data_item,seperate=True)
+        seperate_responses = self.llm.batch_query(seperate_prompts)
+        json_trace_log.log_context_reasoning(docs, seperate_prompts, seperate_responses)
         k = len(docs)
         # Build pairwise prompts to check for contradictory information
         prompts = []
@@ -96,7 +113,6 @@ class GraphBasedRRAG(RRAG):
         premises = []
         hypotheses = []
         pair_indices = []
-        pair_log = [] # every scored pair, for graph_logger
 
         for i in range(k):
             for j in range(i + 1, k):
@@ -117,12 +133,10 @@ class GraphBasedRRAG(RRAG):
 
             # Process each batch item and update edges based on contradiction probability
             for idx, (i, j) in enumerate(pair_indices):
-                contradiction_probability = probs[idx][self.contra_idx].item()
-                is_edge = contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]
-                if is_edge:
+                contradiction_probability = probs[idx][2].item()
+                if contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]:
                     out_edges[i].add(j)
                     in_edges[j].add(i)
-                pair_log.append({'i': i, 'j': j, 'p_contra': contradiction_probability, 'edge': is_edge})
         
         # Iteratively remove vertices with out-degree greater than (number of remaining vertices)/2
         # remaining = set(range(k))
@@ -131,7 +145,6 @@ class GraphBasedRRAG(RRAG):
         for i in range(k):
             remaining.add(i)
         
-        removal_rounds = [] # vertices dropped in each out-degree pruning round
         removal_occurred = True
         while removal_occurred:
             removal_occurred = False
@@ -144,7 +157,6 @@ class GraphBasedRRAG(RRAG):
                     to_remove.append(v)
             if to_remove:
                 removal_occurred = True
-                removal_rounds.append(sorted(to_remove))
                 for v in to_remove:
                     remaining.discard(v)
         
@@ -162,15 +174,12 @@ class GraphBasedRRAG(RRAG):
         
         # Sort selected documents by their original rank order
         selected.sort()
+        json_trace_log.log_graph(
+            'graph', nodes=range(k),
+            edges=[(i, j) for i in range(k) for j in out_edges[i]],
+            cluster=selected, cluster_key='selected_nodes', directed=True,
+            remaining_after_pruning=sorted(remaining))
         
-        graph_logger.record(
-            'graph',
-            nodes=[{'id': i, 'doc_ranks': [i], 'answer': seperate_responses[i],
-                    'idk': "I don't know" in seperate_responses[i]} for i in range(k)],
-            pairs=pair_log, selected=selected, final_doc_ranks=selected,
-            threshold=0.5, directed=True,
-            extra={'removal_rounds': removal_rounds, 'remaining_after_pruning': sorted(remaining)})
-
         # Update the data_item to include only the selected documents
         new_data_item = data_item.copy()
         new_data_item['topk_content'] = [docs[i] for i in selected]
@@ -180,6 +189,7 @@ class GraphBasedRRAG(RRAG):
         
         # Return the final answer by querying the LLM
         final_answer = self.llm._query(ultimate_prompt)
+        json_trace_log.log_final(ultimate_prompt, final_answer, all_answers=seperate_responses)
         print("final_answer: ", final_answer)
         return final_answer
 
@@ -192,21 +202,23 @@ class MISBasedRRAG(RRAG):
         self.err = err
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # device = "cpu"  # for gpt-4o
-        self.nli_tokenizer, self.nli_model, self.contra_idx = load_nli(device=device)
+        self.nli_tokenizer = AutoTokenizer.from_pretrained(NLI_MODEL)
+        self.nli_model = AutoModelForSequenceClassification.from_pretrained(NLI_MODEL).to(device)
 
     def query(self, data_item):
         # Retrieve the documents and get separate responses.
         docs = data_item['topk_content']
         start_time = time.perf_counter()
-        seperate_responses = self.llm.batch_query(self.llm.wrap_prompt(data_item, as_multi_choice='choices' in data_item, seperate=True))
+        seperate_prompts = self.llm.wrap_prompt(data_item, as_multi_choice='choices' in data_item, seperate=True)
+        seperate_responses = self.llm.batch_query(seperate_prompts)
         end_time = time.perf_counter()
         print("time for getting separate responses: ", end_time - start_time)
+        json_trace_log.log_context_reasoning(docs, seperate_prompts, seperate_responses)
         k = len(docs)
         
         # Build an undirected graph: graph[i] holds all vertices j that contradict with document i.
         graph = {i: set() for i in range(k)}
         premises, hypotheses, pair_indices = [], [], [] 
-        pair_log = [] # every scored pair, for graph_logger
 
         for i in range(k):
             for j in range(i + 1, k):
@@ -228,7 +240,7 @@ class MISBasedRRAG(RRAG):
             
             # For each pair, add an undirected edge if the answers contradict.
             for idx, (i, j) in enumerate(pair_indices):
-                contradiction_probability = probs[idx][self.contra_idx].item()
+                contradiction_probability = probs[idx][2].item()
                 x = random.random()
                 if ("I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]):
                     if contradiction_probability >= 0.5:
@@ -239,9 +251,6 @@ class MISBasedRRAG(RRAG):
                         if x <= self.err:
                             graph[i].add(j)
                             graph[j].add(i)                            
-                is_edge = j in graph[i]
-                nli_edge = contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]
-                pair_log.append({'i': i, 'j': j, 'p_contra': contradiction_probability, 'edge': is_edge, 'flipped': is_edge != nli_edge})
                 # if (contradiction_probability >= 0.5 and "I don't know" not in seperate_responses[i] and "I don't know" not in seperate_responses[j]):
                 #     graph[i].add(j)
                 #     graph[j].add(i)
@@ -266,14 +275,12 @@ class MISBasedRRAG(RRAG):
 
         best_set.sort()  # sort in ascending order (better ranked docs have lower indices)
         logger.info(f"Selected document indices: {best_set}")
+        json_trace_log.log_graph(
+            'MIS', nodes=range(k),
+            edges=[(i, j) for i in range(k) for j in graph[i] if i < j],
+            cluster=best_set, directed=False,
+            idk_nodes=sorted(set(range(k)) - z))
         
-        graph_logger.record(
-            'MIS',
-            nodes=[{'id': i, 'doc_ranks': [i], 'answer': seperate_responses[i],
-                    'idk': "I don't know" in seperate_responses[i]} for i in range(k)],
-            pairs=pair_log, selected=best_set, final_doc_ranks=best_set,
-            threshold=0.5, err=self.err)
-
         # Update data_item with only the selected documents.
         new_data_item = data_item.copy()
         new_data_item['topk_content'] = [docs[i] for i in best_set]
@@ -286,6 +293,7 @@ class MISBasedRRAG(RRAG):
         end_time = time.perf_counter()
         print("time for the ultimate query: ", end_time - start_time)
         print("final_answer:", final_answer)
+        json_trace_log.log_final(ultimate_prompt, final_answer, all_answers=seperate_responses)
         return final_answer
 
     def _max_independent_set(self, graph, vertices):
@@ -567,9 +575,14 @@ class RandomSamplingReQueryAgg(RRAG):
         self.num_samples = num_samples
         self.gamma = gamma
 
-        self.use_openai = True
+        embedder = os.environ.get("SAMPLING_EMBEDDER") or ("openai" if os.environ.get("OPENAI_API_KEY") else "hf")
+        if embedder not in ("openai", "hf"):
+            raise ValueError(f"SAMPLING_EMBEDDER must be 'openai' or 'hf', got {embedder!r}")
+        self.use_openai = embedder == "openai"
         self.openai_model = "text-embedding-ada-002"
-        self.hf_model_name = "/scratch/gpfs/bi0600/all-mpnet-base-v2"
+        self.hf_model_name = SAMPLING_HF_MODEL
+        logger.info(f"sampling defense embeddings: "
+                    f"{self.openai_model if self.use_openai else self.hf_model_name}")
 
         if not self.use_openai:
             self.hf_model = SentenceTransformer( self.hf_model_name)
