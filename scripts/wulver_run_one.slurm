@@ -14,9 +14,10 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=06:00:00
-# No --gres=gpu here: inference runs against the shared gpt-oss-120b vLLM
-# server, not a local GPU (see CONNECT_TO_SHARED_VLLM.md, usage rule 4:
-# run heavy client code inside a Slurm job, not on the login node).
+# No --gres=gpu here: inference runs against a gpt-oss-120b vLLM server --
+# by default your own (scripts/serve_gpt_oss_local.slurm, address in
+# ~/vllm_local_server.txt; answers, grading and judging all use it), not a
+# local GPU. Run heavy client code inside a Slurm job, not on the login node.
 #
 # --account/--qos are required: dk694's default account
 # (2026-fall-ds-733-amr239-dk694) only carries QOS=course, which is denied
@@ -54,7 +55,7 @@ export HF_HOME="${HF_HOME:-/project/ss797/dk694/hf_cache}"
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
-MODEL_NAME="${MODEL_NAME:-gpt-oss-120b}"
+MODEL_NAME="${MODEL_NAME:-gpt-oss-120b-local}"
 CONFIG_FILE="${CONFIG_FILE:-scripts/benchmark_configs.txt}"
 # Cap dataset size for a "representative, not exhaustive" benchmark; the sweep
 # passes its own (small) MAX_SAMPLES.

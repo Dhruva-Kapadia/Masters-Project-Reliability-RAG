@@ -97,8 +97,9 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
         elif model_name == 'qwen2.5-32b':
             return _make_qwen_model(**kwargs)
         elif model_name == 'gpt-oss-120b-local':
+            # read at call time so a LOCAL_VLLM_SERVER_FILE from .env (loaded by main.py) applies
             return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL,
-                                   server_file=LOCAL_VLLM_SERVER_FILE, **kwargs)
+                                   server_file=os.environ.get("LOCAL_VLLM_SERVER_FILE", LOCAL_VLLM_SERVER_FILE), **kwargs)
         elif model_name == 'gpt-oss-120b-groq':
             return GroqModel(GROQ_GPT_OSS_MODEL, GPT_TMPL, **kwargs)
         else:
@@ -119,8 +120,9 @@ def create_model(model_name, model_dir, use_open_model_api=True, **kwargs):
         elif model_name == 'qwen2.5-32b':
             return _make_qwen_model(**kwargs)
         elif model_name == 'gpt-oss-120b-local':
+            # read at call time so a LOCAL_VLLM_SERVER_FILE from .env (loaded by main.py) applies
             return SharedVLLMModel('openai/gpt-oss-120b', GPT_TMPL,
-                                   server_file=LOCAL_VLLM_SERVER_FILE, **kwargs)
+                                   server_file=os.environ.get("LOCAL_VLLM_SERVER_FILE", LOCAL_VLLM_SERVER_FILE), **kwargs)
         elif model_name == 'gpt-oss-120b-groq':
             return GroqModel(GROQ_GPT_OSS_MODEL, GPT_TMPL, **kwargs)
         else:

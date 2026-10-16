@@ -95,6 +95,12 @@ def main():
         # An explicit GRADER_BACKEND/JUDGE_BACKEND in the environment still wins.
         os.environ.setdefault('GRADER_BACKEND', 'groq')
         os.environ.setdefault('JUDGE_BACKEND', 'groq')
+    elif args.model_name == 'gpt-oss-120b-local':
+        # Your own server (scripts/serve_gpt_oss_local.slurm): grade and judge
+        # with it too instead of the (shared) server the grader/judge use by
+        # default. An explicit SHARED_VLLM_SERVER_FILE in the environment wins.
+        os.environ.setdefault('SHARED_VLLM_SERVER_FILE', os.environ.get(
+            'LOCAL_VLLM_SERVER_FILE', os.path.expanduser('~/vllm_local_server.txt')))
     LOG_NAME = get_log_name(args)
     logging_level = logging.DEBUG if args.debug else logging.INFO
 

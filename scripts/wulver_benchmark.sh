@@ -1,4 +1,11 @@
 #!/bin/bash
+# Model server: by default the experiments use YOUR OWN gpt-oss-120b server
+# (--model_name gpt-oss-120b-local). One-time setup, then start it:
+#   bash scripts/download_gpt_oss.sh          # login node: weights -> /project/ss797/dk694/models/gpt-oss-120b
+#   mkdir -p log && sbatch scripts/serve_gpt_oss_local.slurm
+#   cat ~/vllm_local_server.txt               # appears once the model is loaded
+# Submitting checks that the server answers first (SKIP_SERVER_CHECK=1 to skip).
+#
 # Submit ReliabilityRAG experiments on Wulver as one Slurm array job (one task
 # per config, scripts/wulver_run_one.slurm) against a vLLM-served model
 # (gpt-oss-120b, qwen2.5-32b, or gpt-oss-120b-local), followed by a job that
@@ -12,8 +19,8 @@
 #
 # ── Experiment 1: sample experiment (sweep) -- same as run_local_groq.sh sweep ──
 #   bash scripts/wulver_benchmark.sh sweep                                # dry run: list configs
-#   bash scripts/wulver_benchmark.sh sweep submit                         # gpt-oss-120b, realtimeqa, 3 questions/config
-#   bash scripts/wulver_benchmark.sh sweep submit qwen2.5-32b open_nq 50  # [MODEL] [DATASET] [MAX_SAMPLES]
+#   bash scripts/wulver_benchmark.sh sweep submit                         # your gpt-oss-120b server, realtimeqa, 3 questions/config
+#   bash scripts/wulver_benchmark.sh sweep submit gpt-oss-120b-local open_nq 50  # [MODEL] [DATASET] [MAX_SAMPLES]
 #
 #   Runs every combination of
 #     attacks    Poison, PIA                    (SWEEP_ATTACKS="Poison PIA")
@@ -25,10 +32,10 @@
 #   it off so every config gets fresh answers.
 #
 # ── Experiment 2: full benchmark ──
-#   bash scripts/wulver_benchmark.sh                           # dry run (gpt-oss-120b)
-#   bash scripts/wulver_benchmark.sh submit                    # gpt-oss-120b
+#   bash scripts/wulver_benchmark.sh                           # dry run
+#   bash scripts/wulver_benchmark.sh submit                    # your own gpt-oss-120b server (default)
+#   bash scripts/wulver_benchmark.sh submit gpt-oss-120b       # the shared lab server (if it is up)
 #   bash scripts/wulver_benchmark.sh submit qwen2.5-32b        # Qwen2.5-32B-Instruct server
-#   bash scripts/wulver_benchmark.sh submit gpt-oss-120b-local # your own server (scripts/serve_gpt_oss_local.slurm must be running)
 #   Scope (see conversation with Claude, 2026-09-24):
 #     - datasets: realtimeqa, open_nq  (both are proper free-form QA and load correctly)
 #     - defenses: all EXCEPT `voting` (needs the -mc dataset variant, whose
@@ -48,11 +55,12 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source scripts/_load_env.sh   # optional paths / tokens from .env
 
 EXPERIMENT=benchmark
 if [[ "${1:-}" == "sweep" ]]; then EXPERIMENT=sweep; shift; fi
 MODE="${1:-dry}"
-MODEL_NAME="${2:-gpt-oss-120b}"
+MODEL_NAME="${2:-gpt-oss-120b-local}"
 case "$MODE" in
   dry|submit) ;;
   *) echo "Unknown mode '$MODE' (expected dry or submit)" >&2; exit 1 ;;
@@ -145,6 +153,29 @@ fi
 if (( N == 0 )); then
   echo "Nothing left to run. Re-plot with: uv run python scripts/aggregate_results.py --run_dir $RUN_DIR $PLOT_ARGS"
   exit 0
+fi
+
+# Make sure the model server is up before queueing jobs that need it
+# (a dead server makes every answer "I don't know", silently).
+if [[ "${SKIP_SERVER_CHECK:-0}" != "1" ]]; then
+  case "$MODEL_NAME" in
+    gpt-oss-120b-local) SERVER_FILE="${LOCAL_VLLM_SERVER_FILE:-$HOME/vllm_local_server.txt}" ;;
+    qwen2.5-32b)        SERVER_FILE="${QWEN_VLLM_SERVER_FILE:-/project/ss797/cs757/KidnapRAG/vllm_server.txt}" ;;
+    *)                  SERVER_FILE="${SHARED_VLLM_SERVER_FILE:-/project/ss797/ap2645/vllm_server.txt}" ;;
+  esac
+  if [[ ! -s "$SERVER_FILE" ]]; then
+    echo "Model server for $MODEL_NAME is not up: $SERVER_FILE is missing." >&2
+    [[ "$MODEL_NAME" == gpt-oss-120b-local ]] && echo "Start it with: mkdir -p log && sbatch scripts/serve_gpt_oss_local.slurm (wait until the file appears)" >&2
+    echo "(SKIP_SERVER_CHECK=1 to submit anyway)" >&2
+    exit 1
+  fi
+  ADDR="$(tr -d '[:space:]' < "$SERVER_FILE")"
+  if ! curl -s --max-time 10 "http://${ADDR}/v1/models" | grep -q '"id"'; then
+    echo "Model server for $MODEL_NAME at $ADDR (from $SERVER_FILE) does not answer /v1/models." >&2
+    echo "Check it with: squeue -u \$USER ; tail log/vllm-server-*.err   (SKIP_SERVER_CHECK=1 to submit anyway)" >&2
+    exit 1
+  fi
+  echo "Model server OK: $MODEL_NAME at $ADDR"
 fi
 
 if (( ! RESUME )); then
