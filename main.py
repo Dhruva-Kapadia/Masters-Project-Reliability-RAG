@@ -21,6 +21,25 @@ from llm_judge import LLMJudge
 import time
 import csv
 
+def load_dotenv(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')):
+    """Load KEY=value lines from .env (API keys: GROQ_API_KEY, HF_TOKEN) into the
+    environment. Variables already set in the shell win; empty values are skipped."""
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding='utf-8-sig') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip()
+            if key.startswith('export '):
+                key = key[len('export '):].strip()
+            value = value.strip().strip('"').strip("'")
+            if key and value and not os.environ.get(key):
+                os.environ[key] = value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Robust RAG')
 
@@ -68,6 +87,7 @@ def main():
         if hasattr(stream, 'reconfigure'):
             stream.reconfigure(errors='backslashreplace')
     print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "No GPU")
+    load_dotenv()
     args = parse_args()
     if args.model_name == 'gpt-oss-120b-groq':
         # Local Groq runs can't reach the Wulver server the grader and LLM

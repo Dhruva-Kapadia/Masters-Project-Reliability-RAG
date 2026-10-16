@@ -229,7 +229,32 @@ class BaseModel:
 
 
     def dump_cache(self): # dump cache to disk
-        joblib.dump(self.cache,self.cache_path)
+        # Several runs may share one cache file (a sweep, or concurrent Slurm
+        # array tasks): merge with what is on disk now and replace the file
+        # atomically -- under an exclusive lock where the OS has flock -- so
+        # concurrent writers never corrupt it or drop each other's entries.
+        lock = None
+        try:
+            try:
+                import fcntl
+                lock = open(self.cache_path + '.lock', 'w')
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            except ImportError:  # Windows: no flock; the atomic replace still prevents corruption
+                pass
+            merged = {}
+            if os.path.exists(self.cache_path):
+                try:
+                    merged = joblib.load(self.cache_path)
+                except Exception as exc:
+                    logger.warning(f"could not read existing cache {self.cache_path} ({exc}); overwriting it")
+            merged.update(self.cache)
+            tmp = f"{self.cache_path}.{os.getpid()}.tmp"
+            joblib.dump(merged, tmp)
+            os.replace(tmp, self.cache_path)
+            self.cache = merged
+        finally:
+            if lock is not None:
+                lock.close()
     
     def load_cache(self): # load cache from disk
         return joblib.load(self.cache_path)

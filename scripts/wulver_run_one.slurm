@@ -27,8 +27,10 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 
-# RUN_DIR is normally set by scripts/wulver_benchmark.sh (sbatch --export),
-# which also points this job's own --output/--error slurm logs at
+# RUN_DIR, MODEL_NAME, CONFIG_FILE, MAX_SAMPLES and USE_CACHE are normally set
+# by scripts/wulver_benchmark.sh (sbatch --export). Each line of CONFIG_FILE is
+#   <dataset> <defense> <attack> [<position, 1-based, default 1>]
+# The wrapper also points this job's own --output/--error slurm logs at
 # <RUN_DIR>/log/. Falls back to a fresh runsN/ if this script is sbatch'd
 # directly without going through the wrapper.
 if [[ -z "${RUN_DIR:-}" ]]; then
@@ -42,31 +44,40 @@ fi
 
 mkdir -p "$RUN_DIR"/{log,output,result,cache}
 
-# NLI model for graph / MIS / sampleMIS (src/nli_config.py). Cached on /project
-# so it is downloaded once (bash scripts/prefetch_nli.sh on a login node) and
-# shared by every array task; compute nodes then load it from disk.
+# NLI model for graph / MIS / sampleMIS. Cached on /project so it is downloaded
+# once (bash scripts/prefetch_nli.sh on a login node) and shared by every array
+# task; compute nodes then load it from disk. HF_TOKEN (if needed) comes from
+# .env, which main.py loads.
 export HF_HOME="${HF_HOME:-/project/ss797/dk694/hf_cache}"
 # DeBERTa runs on CPU here (no --gres=gpu): match torch threads to the
 # allocation instead of letting it oversubscribe the node.
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-4}"
 export MKL_NUM_THREADS="$OMP_NUM_THREADS"
 
-CONFIG_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" scripts/benchmark_configs.txt)
-read -r DATASET DEFENSE ATTACK <<< "$CONFIG_LINE"
-
-echo "=== Task $SLURM_ARRAY_TASK_ID: dataset=$DATASET defense=$DEFENSE attack=$ATTACK run_dir=$RUN_DIR ==="
-
-# Cap dataset size for a "representative, not exhaustive" benchmark; override
-# with MAX_SAMPLES env var if you want the full dataset.
+MODEL_NAME="${MODEL_NAME:-gpt-oss-120b}"
+CONFIG_FILE="${CONFIG_FILE:-scripts/benchmark_configs.txt}"
+# Cap dataset size for a "representative, not exhaustive" benchmark; the sweep
+# passes its own (small) MAX_SAMPLES.
 MAX_SAMPLES="${MAX_SAMPLES:-200}"
+CACHE_ARGS=(--use_cache)
+[[ "${USE_CACHE:-1}" == "1" ]] || CACHE_ARGS=()
+
+CONFIG_LINE=$(sed -n "${SLURM_ARRAY_TASK_ID}p" "$CONFIG_FILE")
+read -r DATASET DEFENSE ATTACK POSITION <<< "$CONFIG_LINE"
+POSITION="${POSITION:-1}"
+[[ -n "$DATASET" && -n "$DEFENSE" && -n "$ATTACK" ]] || { echo "bad config line $SLURM_ARRAY_TASK_ID in $CONFIG_FILE: '$CONFIG_LINE'" >&2; exit 1; }
+
+echo "=== Task $SLURM_ARRAY_TASK_ID: model=$MODEL_NAME dataset=$DATASET defense=$DEFENSE attack=$ATTACK position=$POSITION max_samples=$MAX_SAMPLES run_dir=$RUN_DIR ==="
 
 ATTACK_ARGS=()
 if [[ "$ATTACK" != "none" ]]; then
-  ATTACK_ARGS=(--attack_method "$ATTACK" --corruption_size 1 --attackpos 0)
+  ATTACK_ARGS=(--attack_method "$ATTACK" --corruption_size 1 --attackpos "$((POSITION - 1))")
 fi
 
+# Same hyperparameters as scripts/run_local_groq.sh, so results are comparable.
+# Thinking traces go to $RUN_DIR/log/<config>.traces.json (src/json_trace_log.py).
 uv run python main.py \
-  --model_name gpt-oss-120b \
+  --model_name "$MODEL_NAME" \
   --dataset_name "$DATASET" \
   --top_k 10 \
   --defense_method "$DEFENSE" \
@@ -75,11 +86,9 @@ uv run python main.py \
   --rep 1 \
   --max_samples "$MAX_SAMPLES" \
   --use_open_model_api \
-  --use_cache \
   --save_response \
   --debug \
-  --log_graphs \
   --run_dir "$RUN_DIR" \
-  "${ATTACK_ARGS[@]}"
+  "${CACHE_ARGS[@]}" "${ATTACK_ARGS[@]}"
 
 echo "=== Task $SLURM_ARRAY_TASK_ID done ==="

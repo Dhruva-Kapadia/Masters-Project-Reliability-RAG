@@ -9,7 +9,10 @@
 #
 # Setup (once):
 #   uv sync                                # same env as on the server
-#   export GROQ_API_KEY=gsk_...            # https://console.groq.com/keys
+#   put your keys in .env (copy .env.example):
+#     GROQ_API_KEY=gsk_...                 # https://console.groq.com/keys
+#     HF_TOKEN=hf_...                      # https://huggingface.co/settings/tokens (NLI model download)
+#   (exporting them in the shell works too and takes precedence)
 #
 # ── Mode 1: one config ──────────────────────────────────────────────────────
 #   bash scripts/run_local_groq.sh [DATASET] [DEFENSE] [ATTACK] [MAX_SAMPLES] [POSITION]
@@ -66,7 +69,20 @@ cd "$(dirname "$0")/.."
 # read the UTF-8 datasets; force UTF-8 mode everywhere (harmless on Linux/macOS).
 export PYTHONUTF8=1
 
-[[ -n "${GROQ_API_KEY:-}" ]] || { echo "GROQ_API_KEY is not set (export GROQ_API_KEY=gsk_...)" >&2; exit 1; }
+# Load API keys from .env (git-ignored). Shell variables win; empty values are skipped.
+if [[ -f .env ]]; then
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key="${key%$'\r'}"; value="${value%$'\r'}"
+    key="${key#export }"; key="${key// /}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+    value="${value#\"}"; value="${value%\"}"; value="${value#\'}"; value="${value%\'}"
+    if [[ -n "$value" && -z "${!key:-}" ]]; then export "$key=$value"; fi
+  done < .env
+fi
+
+[[ -n "${GROQ_API_KEY:-}" ]] || { echo "GROQ_API_KEY is not set: add it to .env (see .env.example) or export it" >&2; exit 1; }
+[[ -n "${HF_TOKEN:-}" ]] || echo "note: HF_TOKEN is not set; the NLI model downloads anonymously (slower, rate-limited)" >&2
 
 MODEL=gpt-oss-120b-groq
 TOP_K=10

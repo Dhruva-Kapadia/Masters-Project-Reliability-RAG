@@ -57,3 +57,8 @@ scripts/all_cpu.slurm
 scripts/run_cpu.sh
 scripts/test.sh
 data/unfiltered-web-dev.json
+
+# secrets (API keys) -- keep out of git; .env.example is the template
+.env
+.env.*
+!.env.example

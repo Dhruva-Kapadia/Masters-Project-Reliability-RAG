@@ -21,6 +21,8 @@ def main():
     ap.add_argument('--output_dir', default=None)
     ap.add_argument('--out', default=None)
     ap.add_argument('--no_plots', action='store_true', help='skip writing plots to <output_dir>/plots/')
+    ap.add_argument('--by_position', action='store_true',
+                    help="plot each poisoned position separately ('PIA @ pos 5'), e.g. for the sweep experiment")
     args = ap.parse_args()
 
     if args.run_dir is not None:
@@ -47,17 +49,19 @@ def main():
             print(f"Skipping {f}: {e}")
 
     summary = pd.concat(frames, ignore_index=True)
-    summary = summary.sort_values(['dataset_name', 'defense_method', 'attack_method', 'model_name'])
+    sort_cols = [c for c in ['dataset_name', 'defense_method', 'attack_method', 'attackpos', 'model_name'] if c in summary.columns]
+    summary = summary.sort_values(sort_cols)
     summary.to_csv(args.out, index=False)
 
     print(f"Aggregated {len(files)} run(s) -> {args.out}")
-    cols = ['dataset_name', 'defense_method', 'attack_method', 'acc', 'asr', 'dataset_size']
+    cols = [c for c in ['dataset_name', 'defense_method', 'attack_method', 'attackpos', 'acc', 'asr', 'dataset_size']
+            if c in summary.columns]
     print(summary[cols].to_string(index=False))
 
     if not args.no_plots:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
         from plot_results import load, make_plots
-        df = load(files)
+        df = load(files, by_position=args.by_position)
         if df is not None:
             for p in make_plots(df, os.path.join(args.output_dir, 'plots')):
                 print(f"wrote {p}")
