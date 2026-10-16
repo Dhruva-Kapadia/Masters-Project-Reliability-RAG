@@ -10,7 +10,7 @@
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=160G
-#SBATCH --time=2-22:00:00
+#SBATCH --time=3-00:00:00   # 72 h = the standard QOS maximum; getting GPUs takes hours, so keep one server for many runs
 #
 # Serve YOUR OWN copy of gpt-oss-120b (downloaded with scripts/download_gpt_oss.sh)
 # with vLLM on a GPU node, for --model_name gpt-oss-120b-local. Submit from the

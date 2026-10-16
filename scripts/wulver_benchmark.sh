@@ -218,7 +218,9 @@ AGG_JOB=$(sbatch --parsable \
   --ntasks=1 --cpus-per-task=1 --mem=4G --time=00:20:00 \
   --output="${RUN_DIR}/log/aggregate-%j.out" \
   --wrap "uv run python scripts/aggregate_results.py --run_dir ${RUN_DIR} ${PLOT_ARGS}")
-echo "Submitted aggregate+plot job ${AGG_JOB%%;*} (runs after $ARRAY_JOB)"
+AGG_JOB="${AGG_JOB%%;*}"
+echo "Submitted aggregate+plot job ${AGG_JOB} (runs after $ARRAY_JOB)"
+echo "aggregate_job=$AGG_JOB" >> "$RUN_DIR/run_info.txt"
 
 echo "Results will land under ${RUN_DIR}/output/, ${RUN_DIR}/log/ (incl. *.traces.json), ${RUN_DIR}/result/."
 echo "Summary + plots: ${RUN_DIR}/output/summary.csv and ${RUN_DIR}/output/plots/"
