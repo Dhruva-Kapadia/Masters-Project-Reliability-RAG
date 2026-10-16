@@ -32,10 +32,12 @@
 # (address file, default ~/vllm_local_server.txt), PORT (default: a free port),
 # TP (tensor-parallel GPUs, default: all GPUs of the job), QUANT (default
 # mxfp4, the checkpoint's native format; set QUANT= to let vLLM decide),
-# MAX_MODEL_LEN (32768), GPU_MEM_UTIL (0.90), VLLM_ENV (conda env, default
-# vllm_env), CUDA_MODULE (CUDA/12.8.0). Fewer GPUs: sbatch --gres=gpu:2 ...
+# MAX_MODEL_LEN (32768), GPU_MEM_UTIL (0.90), VLLM_VENV (vLLM install from
+# scripts/setup_vllm_env.sh, default /project/ss797/dk694/envs/vllm), or
+# VLLM_ENV=<conda env> + CUDA_MODULE (CUDA/12.8.0) to use conda instead. Fewer GPUs: sbatch --gres=gpu:2 ...
 # (mxfp4 weights are ~65 GB; 2x80 GB leaves less room for the KV cache).
-# Setup follows "HPC + GPT-OSS Guide" (HPC_GPTOSS_GUIDE.md, section 3).
+# One-time setup: bash scripts/download_gpt_oss.sh (weights) and
+#   sbatch scripts/setup_vllm_env.sh (vLLM). Flags follow HPC_GPTOSS_GUIDE.md, section 3.
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
@@ -51,11 +53,23 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}"
 [[ -f "$MODEL_DIR/config.json" ]] || {
   echo "No model at $MODEL_DIR (config.json missing). Run on a login node first: bash scripts/download_gpt_oss.sh" >&2; exit 1; }
 
-# vLLM environment (same as the shared server's setup)
-CONDA_SH="${CONDA_SH:-/apps/easybuild/el9_5.x86_64/software/Miniforge3/24.11.3-0/etc/profile.d/conda.sh}"
-source "$CONDA_SH"
-conda activate "${VLLM_ENV:-vllm_env}"
-module load "${CUDA_MODULE:-CUDA/12.8.0}"
+# vLLM environment: your own venv from scripts/setup_vllm_env.sh (default), or
+# a conda env if you name one with VLLM_ENV (e.g. VLLM_ENV=vllm_env).
+VLLM_VENV="${VLLM_VENV:-/project/ss797/dk694/envs/vllm}"
+set +u   # activation scripts reference unset variables
+if [[ -n "${VLLM_ENV:-}" ]]; then
+  CONDA_SH="${CONDA_SH:-/apps/easybuild/el9_5.x86_64/software/Miniforge3/24.11.3-0/etc/profile.d/conda.sh}"
+  source "$CONDA_SH"
+  conda activate "$VLLM_ENV"
+  module load "${CUDA_MODULE:-CUDA/12.8.0}"
+elif [[ -x "$VLLM_VENV/bin/vllm" ]]; then
+  source "$VLLM_VENV/bin/activate"
+else
+  echo "vLLM is not installed at $VLLM_VENV. Install it once with: sbatch scripts/setup_vllm_env.sh" >&2
+  echo "(or use an existing conda env: VLLM_ENV=<name> sbatch scripts/serve_gpt_oss_local.slurm)" >&2
+  exit 1
+fi
+set -u
 export HF_HOME="${HF_HOME:-/project/ss797/dk694/hf_cache}"
 export HF_HUB_OFFLINE=1          # weights are local; never reach out to the Hub from the GPU node
 export NCCL_TIMEOUT=3600
