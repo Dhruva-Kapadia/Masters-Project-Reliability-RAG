@@ -33,8 +33,9 @@
 # TP (tensor-parallel GPUs, default: all GPUs of the job), QUANT (default
 # mxfp4, the checkpoint's native format; set QUANT= to let vLLM decide),
 # MAX_MODEL_LEN (32768), GPU_MEM_UTIL (0.90), VLLM_VENV (vLLM install from
-# scripts/setup_vllm_env.sh, default /project/ss797/dk694/envs/vllm), or
-# VLLM_ENV=<conda env> + CUDA_MODULE (CUDA/12.8.0) to use conda instead. Fewer GPUs: sbatch --gres=gpu:2 ...
+# scripts/setup_vllm_env.sh, default /project/ss797/dk694/envs/vllm) or
+# VLLM_ENV=<conda env> to use conda instead, CUDA_MODULE (CUDA/12.8.0; its nvcc
+# is needed for vLLM's kernel JIT), CACHE_ROOT (compile caches, /project/ss797/dk694/.cache). Fewer GPUs: sbatch --gres=gpu:2 ...
 # (mxfp4 weights are ~65 GB; 2x80 GB leaves less room for the KV cache).
 # One-time setup: bash scripts/download_gpt_oss.sh (weights) and
 #   sbatch scripts/setup_vllm_env.sh (vLLM). Flags follow HPC_GPTOSS_GUIDE.md, section 3.
@@ -61,7 +62,6 @@ if [[ -n "${VLLM_ENV:-}" ]]; then
   CONDA_SH="${CONDA_SH:-/apps/easybuild/el9_5.x86_64/software/Miniforge3/24.11.3-0/etc/profile.d/conda.sh}"
   source "$CONDA_SH"
   conda activate "$VLLM_ENV"
-  module load "${CUDA_MODULE:-CUDA/12.8.0}"
 elif [[ -x "$VLLM_VENV/bin/vllm" ]]; then
   source "$VLLM_VENV/bin/activate"
 else
@@ -69,7 +69,31 @@ else
   echo "(or use an existing conda env: VLLM_ENV=<name> sbatch scripts/serve_gpt_oss_local.slurm)" >&2
   exit 1
 fi
+
+# CUDA toolkit: vLLM JIT-compiles some kernels (FlashInfer, Triton) while warming
+# up -- AFTER the ~10 min model load -- and needs nvcc + CUDA_HOME for that. The
+# pip wheels bring the CUDA runtime but not the compiler, so load the module.
+CUDA_MODULE="${CUDA_MODULE:-CUDA/12.8.0}"
+if ! type module >/dev/null 2>&1; then   # batch shells sometimes lack the Lmod function
+  for f in /etc/profile.d/lmod.sh /etc/profile.d/modules.sh /usr/share/lmod/lmod/init/bash; do
+    [[ -f "$f" ]] && { source "$f"; break; }
+  done
+fi
+module load "$CUDA_MODULE" || { echo "could not 'module load $CUDA_MODULE' (see: module avail CUDA; set CUDA_MODULE=...)" >&2; exit 1; }
+if ! command -v nvcc >/dev/null; then
+  echo "nvcc not found after 'module load $CUDA_MODULE' -- vLLM's warm-up would fail with 'Could not find nvcc'" >&2; exit 1
+fi
+export CUDA_HOME="${CUDA_HOME:-${EBROOTCUDA:-$(dirname "$(dirname "$(command -v nvcc)")")}}"
 set -u
+echo "CUDA toolkit: $CUDA_HOME ($(nvcc --version | sed -n 's/.*release \([0-9.]*\).*/\1/p'))"
+
+# JIT / compile caches go to /project, not the small $HOME quota (reused by later jobs)
+CACHE_ROOT="${CACHE_ROOT:-/project/ss797/dk694/.cache}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$CACHE_ROOT/vllm}"
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-$CACHE_ROOT}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$CACHE_ROOT/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$CACHE_ROOT/torchinductor}"
+mkdir -p "$VLLM_CACHE_ROOT" "$TRITON_CACHE_DIR" "$TORCHINDUCTOR_CACHE_DIR"
 export HF_HOME="${HF_HOME:-/project/ss797/dk694/hf_cache}"
 export HF_HUB_OFFLINE=1          # weights are local; never reach out to the Hub from the GPU node
 export NCCL_TIMEOUT=3600

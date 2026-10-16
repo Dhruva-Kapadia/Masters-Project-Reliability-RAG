@@ -1,6 +1,6 @@
 import random
 class Attack:
-    def __init__(self, top_k, repeat=5, poison_pos=0, poison_num=1):
+    def __init__(self, top_k, repeat=1, poison_pos=0, poison_num=1):
         self.top_k = top_k # number of top-k retrieved documents
         self.repeat = repeat # number of times the poison is repeated in the document
         self.poison_loc = [0 for _ in range(top_k)] # no poison
