@@ -175,7 +175,19 @@ if [[ "${SKIP_SERVER_CHECK:-0}" != "1" ]]; then
     echo "Check it with: squeue -u \$USER ; tail log/vllm-server-*.err   (SKIP_SERVER_CHECK=1 to submit anyway)" >&2
     exit 1
   fi
-  echo "Model server OK: $MODEL_NAME at $ADDR"
+  # one real dummy query (a server can list the model yet fail to generate)
+  echo "Model server for $MODEL_NAME at $ADDR is up; sending a dummy query ..."
+  if ! bash scripts/check_server.sh "$ADDR" | sed 's/^/  /'; then
+    echo "Model server at $ADDR did not answer the dummy query (SKIP_SERVER_CHECK=1 to submit anyway)" >&2
+    exit 1
+  fi
+fi
+
+# Make sure the Python environment works BEFORE queueing jobs that wait hours
+# for a slot: sync it once here (the jobs themselves run with --no-sync) and
+# import what main.py needs. SKIP_ENV_CHECK=1 to skip.
+if [[ "${SKIP_ENV_CHECK:-0}" != "1" ]]; then
+  bash scripts/check_env.sh || exit 1
 fi
 
 if (( ! RESUME )); then
@@ -217,7 +229,7 @@ AGG_JOB=$(sbatch --parsable \
   --account="$(hdr account)" --partition="$(hdr partition)" --qos="$(hdr qos)" \
   --ntasks=1 --cpus-per-task=1 --mem=4G --time=00:20:00 \
   --output="${RUN_DIR}/log/aggregate-%j.out" \
-  --wrap "uv run python scripts/aggregate_results.py --run_dir ${RUN_DIR} ${PLOT_ARGS}")
+  --wrap "uv run --no-sync python scripts/aggregate_results.py --run_dir ${RUN_DIR} ${PLOT_ARGS}")
 AGG_JOB="${AGG_JOB%%;*}"
 echo "Submitted aggregate+plot job ${AGG_JOB} (runs after $ARRAY_JOB)"
 echo "aggregate_job=$AGG_JOB" >> "$RUN_DIR/run_info.txt"

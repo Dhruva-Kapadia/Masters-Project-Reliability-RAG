@@ -77,7 +77,10 @@ fi
 
 # Same hyperparameters as scripts/run_local_groq.sh, so results are comparable.
 # Thinking traces go to $RUN_DIR/log/<config>.traces.json (src/json_trace_log.py).
-uv run python main.py \
+# --no-sync: never modify the shared .venv from inside a job (many tasks run at
+# once; concurrent syncs can leave packages half-installed). wulver_benchmark.sh
+# syncs and checks the environment once before submitting.
+uv run --no-sync python main.py \
   --model_name "$MODEL_NAME" \
   --dataset_name "$DATASET" \
   --top_k 10 \

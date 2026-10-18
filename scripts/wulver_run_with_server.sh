@@ -94,6 +94,8 @@ done
 [[ " ${ARGS[*]} " == *" submit "* ]] || { echo "nothing to do: arguments must include 'submit' (try a dry run with bash scripts/wulver_benchmark.sh ${ARGS[*]})" >&2; exit 1; }
 
 mkdir -p log
+# broken Python environment? find out now, not after hours of queueing
+bash scripts/check_env.sh
 # dry run first, so a typo in the arguments fails now and not after an hour in the queue
 DRY_ARGS=("${ARGS[@]/submit/dry}")
 dry_out="$(SKIP_SERVER_CHECK=1 bash scripts/wulver_benchmark.sh "${DRY_ARGS[@]}" 2>&1)" || { echo "$dry_out" >&2; exit 1; }
